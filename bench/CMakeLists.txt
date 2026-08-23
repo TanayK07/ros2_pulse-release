@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.8)
+project(stats_probe_bench)
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(std_msgs REQUIRED)
+add_executable(stress_nodes stress_nodes.cpp)
+target_link_libraries(stress_nodes rclcpp::rclcpp ${std_msgs_TARGETS})

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ros2-pulse-top"
+version = "0.2.0"
+description = "Live terminal dashboard over a ros2_pulse probe log, no ROS dependency, no graph presence"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["ros2", "ros", "robotics", "observability", "tui", "textual"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Monitoring",
+]
+dependencies = ["textual>=1.0"]
+
+[project.urls]
+Homepage = "https://github.com/TanayK07/ros2_pulse"
+Repository = "https://github.com/TanayK07/ros2_pulse"
+Changelog = "https://github.com/TanayK07/ros2_pulse/blob/main/CHANGELOG.md"
+Issues = "https://github.com/TanayK07/ros2_pulse/issues"
+
+[project.scripts]
+pulse-top = "pulse_top.app:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-asyncio>=0.23"]
+
+[tool.setuptools.packages.find]
+include = ["pulse_top*"]
+
+[tool.setuptools.package-data]
+pulse_top = ["*.tcss"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
