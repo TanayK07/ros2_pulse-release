@@ -1,0 +1,23 @@
+## ros2_pulse (humble) - 0.4.1-1
+
+The packages in the `ros2_pulse` repository were released into the `humble` distro by running `/usr/bin/bloom-release -y --rosdistro humble --track humble ros2_pulse --override-release-repository-url https://github.com/TanayK07/ros2_pulse-release.git --override-release-repository-push-url https://github.com/TanayK07/ros2_pulse-release.git --no-web --no-pull-request` on `Sun, 23 Aug 2026 15:41:49 -0000`
+
+The `ros2_pulse` package was released.
+
+Version of package(s) in repository `ros2_pulse`:
+
+- upstream repository: https://github.com/TanayK07/ros2_pulse.git
+- release repository: unknown
+- rosdistro version: `null`
+- old version: `None-0`
+- new version: `0.4.1-1`
+
+Versions of tools used:
+
+- bloom version: `0.13.0`
+- catkin_pkg version: `1.1.0`
+- rosdep version: `0.26.0`
+- rosdistro version: `1.0.1`
+- vcstools version: `0.1.42`
+
+
