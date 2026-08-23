@@ -1,0 +1,13 @@
+Source: ros-kilted-ros2-pulse
+Section: misc
+Priority: optional
+Maintainer: Tanay Kedia <95276223+TanayK07@users.noreply.github.com>
+Build-Depends: debhelper (>= 9.0.0), lttng-tools <!nocheck>, ros-kilted-ament-cmake, ros-kilted-ament-cmake-gtest <!nocheck>, ros-kilted-ament-cmake-pytest <!nocheck>, ros-kilted-rclcpp <!nocheck>, ros-kilted-ros2run <!nocheck>, ros-kilted-std-msgs <!nocheck>, ros-kilted-ros-workspace
+Homepage: 
+Standards-Version: 3.9.2
+
+Package: ros-kilted-ros2-pulse
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ros-kilted-ros-workspace
+Description: Near-zero-overhead ROS 2 probe for per-topic message frequency and active-node liveness, covering both inter-process and intra-process traffic.
+ Works on stock ROS 2 binaries via an LD_PRELOAD shim over the tracetools instrumentation layer: no patched rmw_implementation, no ROS recompile, no privileges, and no DDS traffic.
