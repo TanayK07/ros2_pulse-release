@@ -1,3 +1,4 @@
+release_repo_url: https://github.com/TanayK07/ros2_pulse-release.git
 tracks:
   humble:
     actions: &id001
