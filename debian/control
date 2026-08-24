@@ -1,0 +1,13 @@
+Source: ros-jazzy-ros2-pulse
+Section: misc
+Priority: optional
+Maintainer: "Tanay Kedia" <95276223+TanayK07@users.noreply.github.com>
+Build-Depends: debhelper (>= 9.0.0), lttng-tools <!nocheck>, ros-jazzy-ament-cmake, ros-jazzy-ament-cmake-gtest <!nocheck>, ros-jazzy-ament-cmake-pytest <!nocheck>, ros-jazzy-rclcpp <!nocheck>, ros-jazzy-ros2run <!nocheck>, ros-jazzy-std-msgs <!nocheck>, ros-jazzy-ros-workspace
+Homepage: https://index.ros.org/p/ros2_pulse/#jazzy
+Standards-Version: 3.9.2
+
+Package: ros-jazzy-ros2-pulse
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ros-jazzy-ros-workspace
+Description: Near-zero-overhead ROS 2 probe for per-topic message frequency and active-node liveness, covering both inter-process and intra-process traffic.
+ Works on stock ROS 2 binaries via an LD_PRELOAD shim over the tracetools instrumentation layer: no patched rmw_implementation, no ROS recompile, no privileges, and no DDS traffic.
