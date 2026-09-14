@@ -13,7 +13,7 @@ under a nanosecond per message; the whole probe costs about 2 % of workload CPU 
 
 ![pulse-top: live terminal dashboard over the probe's jsonl log, catching a /scan stall and a /cmd_vel rate sag as they happen](docs/assets/pulse-top-demo.gif)
 
-*`pulse-top --demo`: the probe's log, live. Sparklines per topic, intra-process rates, structured warnings with ages. [Install](tools/pulse-top/).*
+*`pulse-top --demo`: the probe's log, live. Sparklines per topic, intra-process rates, structured warnings with ages. Install: `pip3 install ros2-pulse-top` ([details](tools/pulse-top/)).*
 
 [![40-second launch video: the cost of ros2 topic hz and echo, the one-line probe, pulse-top catching a stall, the measured numbers](docs/assets/launch-video-poster.jpg)](https://github.com/TanayK07/ros2_pulse/releases/download/v0.4.0/ros2_pulse-launch.mp4)
 
@@ -66,7 +66,9 @@ WARN  TOPIC /scan hz=1.200000 expected=[18,22]  # only with an expected-rate spe
 
 If a sidecar exporter or a log shipper is reading instead of a person, `ROS_TOPIC_STATS_FORMAT=jsonl`
 writes every window as one JSON object per line with the same gates and values. See
-[JSON Lines output](#json-lines-output-ros_topic_stats_formatjsonl).
+[JSON Lines output](#json-lines-output-ros_topic_stats_formatjsonl). Dashboards that already
+read rclcpp's built-in topic statistics get the same numbers on `/statistics` from the
+[`pulse_bridge`](#publishing-on-statistics-pulse_bridge) sidecar.
 
 ## How it works
 
@@ -91,9 +93,36 @@ The pure C++ core (`core/`) has no ROS dependency and is unit tested on its own;
 
 ## Install
 
+### apt
+
+Binary packages are built for Humble, Jazzy and Kilted:
+
+```bash
+sudo apt update && sudo apt install ros-$ROS_DISTRO-ros2-pulse
+```
+
+They are in `ros2-testing` today and reach the main ROS 2 apt repository at the next sync. To
+install before that sync, add the testing repository first:
+
+```bash
+echo "deb http://packages.ros.org/ros2-testing/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" \
+  | sudo tee /etc/apt/sources.list.d/ros2-testing.list
+sudo apt update
+```
+
+### From source
+
 ```bash
 cd ~/ros2_ws/src && git clone https://github.com/TanayK07/ros2_pulse.git
 cd ~/ros2_ws && colcon build --packages-select ros2_pulse && source install/setup.bash
+```
+
+### pulse-top
+
+The [`pulse-top`](tools/pulse-top/) dashboard installs separately, no ROS environment needed:
+
+```bash
+pip3 install ros2-pulse-top
 ```
 
 Requires ROS 2 Humble, Jazzy or Kilted (all three are CI-tested on stock `ros:<distro>` images,
@@ -161,6 +190,44 @@ Schema rules, pinned by golden-byte unit tests:
 `pulse-check` sniffs the format per line (a `{` first byte can only be a jsonl record), so
 watchdog and CI gating work unchanged on jsonl logs. A file of non-probe JSON still exits 2
 (`no probe windows`) rather than passing.
+
+### Publishing on `/statistics` (`pulse_bridge`)
+
+If something already consumes rclcpp's built-in topic statistics, `pulse_bridge` republishes the
+probe's windows there: one `statistics_msgs/MetricsMessage` per topic per window, in the same
+shape (`unit` `ms`, `AVERAGE` = message period, `SAMPLE_COUNT` = messages in the window,
+`MAXIMUM` = largest inter-arrival gap when jitter tracking is on). Intra-process topics
+included, which is what the built-in statistics cannot report on Humble
+([rclcpp#2911](https://github.com/ros2/rclcpp/issues/2911)).
+
+```bash
+# Probed processes write jsonl (the bridge reads line by line; text windows span lines).
+export ROS_TOPIC_STATS_FORMAT=jsonl
+LD_PRELOAD=$(ros2 pkg prefix ros2_pulse)/lib/libros2_pulse.so ros2 launch my_robot bringup.launch.py
+
+# One sidecar per machine. Follows $TMPDIR/topic_freq.*.log by default and picks up
+# processes that start later.
+ros2 run ros2_pulse pulse_bridge
+ros2 topic echo /statistics
+```
+
+It is a separate process on purpose. The probe stays out of the DDS graph and never links
+rclcpp, so watching the numbers still cannot perturb them; what joins the graph is one small
+message per topic per window from a process that is not the one under test.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `files` | `[]` | Explicit log paths to follow. |
+| `glob` | `$TMPDIR/topic_freq.*.log` | Re-expanded on every poll, so a probed process that starts later is picked up. |
+| `topic` | `/statistics` | Where to publish. |
+| `unit` | `ms` | `ms`: `AVERAGE` is the message period (built-in convention). `Hz`: `AVERAGE` is the rate, no `MAXIMUM`. |
+| `poll_period_s` | `1.0` | How often the logs are read. |
+| `source_name` | `""` | `measurement_source_name`. Empty: the window's single node name, or `ros2_pulse` when the process has several. |
+
+The rate is taken at the subscription when the process has one (what the built-in statistics
+measure) and at the publisher otherwise. Inter- and intra-process paths report the busier of
+the two, not the sum: one publish can hit both tracepoints. A text-format log is refused with
+one warning per file.
 
 ### Expected-rate alerting
 
