@@ -1,3 +1,26 @@
+## ros2_pulse (jazzy) - 0.5.0-1
+
+The packages in the `ros2_pulse` repository were released into the `jazzy` distro by running `/home/tanay/.local/bin/bloom-release ros2_pulse --track jazzy --rosdistro jazzy -y --no-web --no-pull-request --override-release-repository-url https://github.com/TanayK07/ros2_pulse-release.git --override-release-repository-push-url https://github.com/TanayK07/ros2_pulse-release.git` on `Mon, 14 Sep 2026 15:25:28 -0000`
+
+The `ros2_pulse` package was released.
+
+Version of package(s) in repository `ros2_pulse`:
+
+- upstream repository: https://github.com/TanayK07/ros2_pulse.git
+- release repository: https://github.com/TanayK07/ros2_pulse-release.git
+- rosdistro version: `0.4.1-2`
+- old version: `0.4.1-2`
+- new version: `0.5.0-1`
+
+Versions of tools used:
+
+- bloom version: `0.14.3`
+- catkin_pkg version: `1.1.0`
+- rosdep version: `0.26.0`
+- rosdistro version: `1.0.1`
+- vcstools version: `0.1.42`
+
+
 ## ros2_pulse (humble) - 0.5.0-1
 
 The packages in the `ros2_pulse` repository were released into the `humble` distro by running `/home/tanay/.local/bin/bloom-release ros2_pulse --track humble --rosdistro humble -y --no-web --no-pull-request --override-release-repository-url https://github.com/TanayK07/ros2_pulse-release.git --override-release-repository-push-url https://github.com/TanayK07/ros2_pulse-release.git` on `Mon, 14 Sep 2026 15:24:14 -0000`
