@@ -5,6 +5,122 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-14
+
+Receive rates for rclpy nodes, loaned-message counts, and the tracetools version in the banner. pulse-top 0.5.0 reads the loan fields.
+
+### Added
+- **Receive rates for rclpy and every other non-rclcpp rcl client.** The probe now also hooks the
+  `rmw_take` tracepoint, which carries the rmw subscription handle and a `taken` flag, and counts
+  a successful take into the topic's `RECV inter` rate. The handle maps to the topic through
+  `rcl_subscription_init`, which was already hooked. `rcl_take` is not used: its tracepoint carries
+  only the message pointer and fires even when nothing was taken. rclcpp subscriptions stay on
+  `callback_start`, decided per subscription through `rclcpp_subscription_init`, so an rclcpp
+  delivery is never counted twice, and the intra-process plus external subscriber case (rclcpp
+  takes and drops its own DDS copy) does not inflate the rate. Takes on rmw-internal readers and
+  empty takes are ignored. Needs an rmw that emits `rmw_take`: Cyclone DDS and Fast DDS on every
+  distro, Connext from Jazzy. On Humble, serialized and loaned takes emit nothing.
+- **tracetools version in the startup banner, and a warning on an untested one.** The banner now
+  ends with `tracetools=<version>`, read from the tracetools package.xml next to the
+  libtracetools.so serving the hooks (the `rcl_init` tracepoint's version field is added inside
+  tracetools, the interposer never sees it). A major other than the ones CI runs (4.x Humble,
+  8.x Jazzy to Lyrical, 9.x Rolling) prints a one-line warning; counting still proceeds, since
+  upstream deprecates tracepoint arguments rather than removing them.
+- **Loaned-message counts per topic (rclcpp#3153 follow-up).** A loaned message cannot be told
+  apart from a copy at the tracepoint level (Jazzy+ fires the plain `rcl_publish` tracepoint for
+  a loaned publish, only Rolling traces the loaned take, Humble traces neither), so the probe
+  now also interposes `rcl_publish_loaned_message` and `rcl_take_loaned_message` by name. rclcpp
+  calls them only when the middleware can loan, so a successful call is a real loan. New
+  additive `LOAN <topic> pub|recv hz=` text lines and `pub_loaned_hz` / `recv_loaned_hz` jsonl
+  keys, absent when zero (loan-free logs are byte-identical). They are subsets: `TOPIC` /
+  `pub_inter_hz` stays the total publish rate on every distro, without double counting the
+  Jazzy+ tracepoint, which the probe detects at run time on the first loan. `pulse-check`'s
+  reader, pulse-top and pulse-export read the new fields; pulse-export adds
+  `ros2_pulse_topic_loaned_rate_hertz{side=pub|recv}`. The two rcl symbols join the export map
+  by exact name; unlike tracepoints their signatures are stable per distro, not promised across
+  distros (README Limitations, docs/DESIGN.md). The real functions are found through
+  `RTLD_NEXT`, or through the already-loaded librcl when a plugin loaded it `RTLD_LOCAL`, so the
+  wrappers never turn a working loaned call into an error. Verified end to end on Humble with
+  Fast DDS data sharing (`test/integration/test_loaned.py`), and the same code without the
+  profile counts zero loans.
+- **pulse-top 0.4.0: `pulse-export`, Prometheus / OTLP exporter and a Grafana example.** A
+  second entry point in `ros2-pulse-top` that tails the probe's jsonl logs with pulse-top's
+  follower and parser and serves `/metrics` in the Prometheus text format on port 9464 from a
+  stdlib HTTP server: per-topic publish and callback rate per path, largest gap, `recv_lag`
+  deficit, active warns, node up and last-seen age, per-process window period, age and
+  timestamp, and window / warn / skipped-line counters, labelled `pid` (from
+  `topic_freq.<pid>.log`), `topic`, `node`. `--otlp URL` pushes the same series as OTLP/HTTP
+  JSON through `urllib` (gauges, cumulative sums, UCUM units; checked against OpenTelemetry
+  Collector 0.128.0). Absent keys stay absent series, never 0; a process that stops flushing
+  loses its topic series after two periods and keeps a growing age. No new dependency.
+  `examples/grafana/` holds a docker compose (exporter, Prometheus, Grafana) and a provisioned
+  dashboard, `--demo` included; docs page `docs/EXPORT.md`. `default_log_path` moved from
+  `app.py` to `reader.py` so the exporter does not import the TUI. 19 new pulse-top tests.
+- **pulse-top 0.3.0: `recv_lag` warn (issue #50).** When a publisher's process and a
+  subscriber's process are both probed, pulse-top pairs the topic's publish rate (busier path)
+  with its callback rate (inter + intra) and warns once the callbacks sit more than `--lag-tol`
+  (default 10%) and more than two messages per window under the publish rate for
+  `--lag-windows` (default 3) consecutive windows; it clears under half the tolerance and holds
+  in between. A publish observation older than 1.5 periods cannot pair, so a dead or idle
+  publisher (recv reads an explicit 0.0, KNOWN_ISSUES #12) is not lag; trackers are keyed by
+  topic and source log, so a healthy subscriber process does not mask a lagging one, and a warn
+  whose subscriber stopped flushing clears by time. Amber in the table (RECV cell), strip and
+  Warns tab, with deficit, windows and source file in the sidebar; the text says the probe
+  counts callbacks, not wire samples, so it cannot tell a drop from a backlog. Derived by the
+  consumer: the probe, its output format, the spec grammar and `pulse-check` are unchanged.
+  Test node mode `slow_listener <ms>` and `test/integration/test_recv_lag.py` prove the two
+  logs carry the gap and the model derives the warn from them; 21 new pulse-top tests.
+- **Blog post, "Watching a ROS 2 topic changes it"
+  (`docs/blog/2026-09-18-watching-a-ros2-topic-changes-it.md`, on the docs site under Blog).**
+  The observer-effect bench written up for a systems-programming audience: what a subscriber
+  costs (`hz` 7 %, `echo` 31 % of a core per watched 100 KB topic), why `hz` on an
+  intra-process topic switches serialization on in the watched process (+52 % CPU, 10/10
+  trials), how `LD_PRELOAD` interposition of the `ros_trace_*` symbols counts in-process
+  instead, and what that costs (+1.9 % ± 0.7 % paired). Every number cites its file and line
+  in a trailing comment. Two figures under `docs/assets/blog/`, regenerated from the committed
+  CSV by `bench/plot_observer_effect.py`. `site/build.py` now rewrites links relative to the
+  page's own directory (pages under `blog/`), and folds `../` in link targets, so a results
+  page linking `../../bench/RESULTS.md` lands on the benchmarks page instead of GitHub.
+
+### Fixed
+- **A loaned publisher on Humble had no `TOPIC` line.** Humble's `rcl_publish_loaned_message`
+  fires no tracepoint, so a node publishing through `borrow_loaned_message()` with a
+  loan-capable middleware (Fast DDS with data sharing on) was invisible on the publish side. The
+  new loaned-message wrapper (see Added) counts it in the total as well.
+- **pulse-top 0.4.1: pulse-top found no files on a default-format stack (issue #58).** With the
+  probe in `.bashrc` and no `ROS_TOPIC_STATS_FORMAT`, every log is in the default text format.
+  pulse-top parsed jsonl only, and it redrew the top bar only after a parsed window, so a
+  directory of healthy text logs read "0 file(s)" forever even though the glob had matched them
+  all. pulse-top and pulse-export now read the text format as well, sniffed per line like the C++
+  `log_reader`, and a text window maps to the same `Window` its jsonl twin parses to (a line the
+  probe did not print stays an absent field, never 0). The top bar is redrawn every tick, puts the
+  file count before the path, and a notice line says why the table is empty: no file matches yet,
+  N files found and waiting for the first window, or which files are not probe output. The
+  follower now keeps blank lines, which close a text window, so no window arrives one period late.
+  pulse-export's `lines_skipped_total` counts only lines that are in neither format.
+- **pulse-top 0.4.1: `--theme light|dark|terminal` and `PULSE_TOP_THEME` (issue #59).** The colours
+  were hard-coded for a dark background, unreadable on the white terminals used outdoors. `light`
+  is black on white with warn colours picked to read on white (amber is brown, not yellow);
+  `terminal` paints nothing and uses the terminal's own background and ANSI palette (Textual's
+  `ansi-dark` theme); `dark` stays the default. The stylesheet now takes every colour from the
+  Textual theme. The active tab's label was invisible while the tab bar had focus (purple on
+  purple) and is readable again. Textual floor raised to 8.2.7 for the ANSI theme.
+- **A publisher frozen by SIGSTOP read as a ~0 ms gap after it resumed.** The flush timer
+  advanced its deadline one interval per fire, so when the whole probed process was frozen (the
+  flush thread with it) it replayed every missed tick back to back on SIGCONT: one window
+  carrying the stall, then a burst of ~0-length windows with a near-0 `pub_max_dt_ms` /
+  `recv_max_dt_ms` and nonsense Hz (50,000 Hz in one run). pulse-top and pulse-export keep the
+  latest window, so a 5 s camera freeze showed as a 0.03 ms gap and the `topic_gap` warn was
+  buried. The timer now re-phases instead of replaying: after a stall there is exactly one long
+  window holding the full gap (5021 ms on the same repro), then normal cadence, and no window is
+  ever shorter than half a period. Same fix on the receive side (a frozen subscriber process).
+  The gap accounting itself was already right and is unchanged; the hot path is untouched.
+  Regression test `Timer.NoCatchUpBurstAfterStall`.
+
+### Changed
+- docs/ALTERNATIVES.md compares against NVIDIA's `greenwave_monitor`, the packaged subscriber-based
+  monitor a Discourse reader said they were switching from; section plus a positioning-table row.
+
 ## [0.5.0] - 2026-09-09
 
 Adds an optional `/statistics` sidecar. The probe itself is unchanged.
