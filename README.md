@@ -15,9 +15,11 @@ under a nanosecond per message; the whole probe costs about 2 % of workload CPU 
 
 *`pulse-top --demo`: the probe's log, live. Sparklines per topic, intra-process rates, structured warnings with ages. Install: `pip3 install ros2-pulse-top` ([details](tools/pulse-top/)).*
 
-[![40-second launch video: the cost of ros2 topic hz and echo, the one-line probe, pulse-top catching a stall, the measured numbers](docs/assets/launch-video-poster.jpg)](https://github.com/TanayK07/ros2_pulse/releases/download/v0.4.0/ros2_pulse-launch.mp4)
+[![40-second launch video: the cost of ros2 topic hz and echo, the one-line probe, pulse-top catching a stall, the measured numbers](docs/assets/launch-video-poster.jpg)](https://www.youtube.com/watch?v=kxVW-43J12M)
 
-*Forty seconds on what watching a topic costs and what the probe does instead. [Watch the video](https://github.com/TanayK07/ros2_pulse/releases/download/v0.4.0/ros2_pulse-launch.mp4) (MP4, 10 MB) or read the [docs](https://tanayk07.github.io/ros2_pulse/).*
+*Forty seconds on what watching a topic costs and what the probe does instead. [Watch the video](https://www.youtube.com/watch?v=kxVW-43J12M) (40 s, YouTube) or read the [docs](https://tanayk07.github.io/ros2_pulse/).*
+
+*The long version, for systems programmers: [Watching a ROS 2 topic changes it](docs/blog/2026-09-18-watching-a-ros2-topic-changes-it.md), the observer-effect measurement and the symbol-interposition trick that avoids it.*
 
 ---
 
@@ -59,6 +61,7 @@ PUB   /points inter=0.000000 intra=30.000000   # publish-side incl. intra (Iron+
 RECV  /scan inter=20.000000 intra=0.000000 # receive-side, BOTH transports
 RECV  /points inter=0.000000 intra=30.000000   # <- intra-process, invisible to other tools on Humble
 JITTER /scan recv max_dt_ms=21.284             # largest inter-arrival gap (opt-in, see below)
+LOAN  /cloud pub hz=30.000000                  # middleware-loaned share of the publishes (see below)
 NODE  /perception
 NODE  /planner
 WARN  TOPIC /scan hz=1.200000 expected=[18,22]  # only with an expected-rate spec (see below)
@@ -68,7 +71,8 @@ If a sidecar exporter or a log shipper is reading instead of a person, `ROS_TOPI
 writes every window as one JSON object per line with the same gates and values. See
 [JSON Lines output](#json-lines-output-ros_topic_stats_formatjsonl). Dashboards that already
 read rclcpp's built-in topic statistics get the same numbers on `/statistics` from the
-[`pulse_bridge`](#publishing-on-statistics-pulse_bridge) sidecar.
+[`pulse_bridge`](#publishing-on-statistics-pulse_bridge) sidecar, and Prometheus, OTLP and
+Grafana get them from [`pulse-export`](#prometheus-otlp-and-grafana-pulse-export).
 
 ## How it works
 
@@ -85,6 +89,12 @@ probe works with no tracing session and adds no DDS traffic.
   with a stride-breaking hash. No global lock, no per-message string hashing. Counting costs
   about 0.3 ns/op on a fixed endpoint and 0.6 to 1.2 ns/op alternating across a working set on
   the reference box, two orders of magnitude under a single LTTng-UST tracepoint (about 158 ns).
+- Loaned messages are the one thing a tracepoint cannot tell apart from a copy, so the probe
+  also wraps two rcl functions by name, `rcl_publish_loaned_message` and
+  `rcl_take_loaned_message`. rclcpp calls them only when the middleware really loans, so each
+  successful call is counted as a loan and reported as an additive `LOAN <topic> pub|recv hz=`
+  line (a subset of the `TOPIC` / `RECV` total, absent when zero). See
+  [docs/DESIGN.md](docs/DESIGN.md#loaned-messages-wrapping-rcl-not-a-tracepoint).
 - A background timer snapshots and resets the counts every `ROS_TOPIC_STATISTICS_PUBLISH_PERIOD`
   seconds and appends the rates to `ROS_TOPIC_STATS_OUTPUT_FILE`.
 
@@ -101,8 +111,9 @@ Binary packages are built for Humble, Jazzy and Kilted:
 sudo apt update && sudo apt install ros-$ROS_DISTRO-ros2-pulse
 ```
 
-They are in `ros2-testing` today and reach the main ROS 2 apt repository at the next sync. To
-install before that sync, add the testing repository first:
+Jazzy is in the main ROS 2 apt repository (synced 2026-09-11), so that line is all it needs.
+Humble and Kilted are in `ros2-testing` and reach the main repository at their next sync; to
+install them before that, add the testing repository first:
 
 ```bash
 echo "deb http://packages.ros.org/ros2-testing/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" \
@@ -179,11 +190,16 @@ Schema rules, pinned by golden-byte unit tests:
   matching text line would, and `pub_max_dt_ms` / `recv_max_dt_ms` only when gap tracking
   measured that side (`ROS_TOPIC_STATS_JITTER`). A missing gap is unknown, not "perfectly
   smooth".
+- `pub_loaned_hz` / `recv_loaned_hz` appear only when the window saw a middleware loan
+  (`rcl_publish_loaned_message` / `rcl_take_loaned_message` succeeding). They are subsets of
+  `pub_inter_hz` and of the receive total, never added to them.
 - `topics`, `nodes` and `warns` are always present (empty arrays when empty), so `.warns[]`
   needs no null guards.
 - `warns` are structured (`kind` is `topic_rate`, `topic_gap` or `node_missing`, with the
   numbers as JSON numbers) rather than preformatted strings. An unbounded `max_hz` omits the
   key, since JSON has no `Infinity`. The text `WARN` line is a rendering of the same data.
+  `pulse-top`'s `recv_lag` (callbacks under the publish rate, compared across two processes'
+  windows) is derived by that consumer and never written by the probe.
 - Topic and node names are escaped per RFC 8259, so a hostile name cannot break the
   one-object-per-line framing.
 
@@ -228,6 +244,20 @@ The rate is taken at the subscription when the process has one (what the built-i
 measure) and at the publisher otherwise. Inter- and intra-process paths report the busier of
 the two, not the sum: one publish can hit both tracepoints. A text-format log is refused with
 one warning per file.
+
+### Prometheus, OTLP and Grafana (`pulse-export`)
+
+`pulse-export` ships with pulse-top (`pip3 install ros2-pulse-top`) and serves the probe's logs
+(text or jsonl) as Prometheus metrics on `:9464/metrics` (per-topic publish and callback rates, gaps,
+`recv_lag`, warns, node liveness, per-process window age), optionally pushing the same series
+over OTLP/HTTP (`--otlp http://collector:4318`). Standard library only, no ROS dependency, no
+graph presence. To see a probed robot on a Grafana dashboard:
+
+```bash
+docker compose -f examples/grafana/docker-compose.yml up --build   # then open http://localhost:3000
+```
+
+Metric names, labels and staleness rules: [docs/EXPORT.md](docs/EXPORT.md).
 
 ### Expected-rate alerting
 
@@ -285,6 +315,14 @@ A rule may violate the rate bound and the gap bound independently, producing two
 `max_gap_ms` turns measurement on by itself; you do not also need `ROS_TOPIC_STATS_JITTER=1`.
 This also covers control loops driven by `rclcpp::Rate` or a raw `sleep_until` rather than a
 timer (`ros2_control`, Nav2, MoveIt Servo): they publish, so their stalls show up here.
+
+A gap is reported in every window it is open in and in the window where the next message
+arrives, so a silent topic's gap grows window by window and a `max_gap_ms` rule fires while it
+stays silent (a `min_hz` rule fires on the 0 Hz as well). If the whole probed process freezes
+(SIGSTOP, a debugger, a VM pause) its flush thread freezes too, so nothing is written during the
+stall; the first window after it resumes is one long window (its `window_s` spans the stall) that
+carries the full gap, and the cadence restarts from there. Watch window age from outside
+(`pulse-top`, `pulse-export`) to see a process that is frozen right now.
 
 Evaluation happens only at flush time (the hot path never sees the spec) and each probed process
 only judges endpoints it hosts. The first window (attach ramp-up) and the final atexit window (a
@@ -355,11 +393,28 @@ are in [`test/orin/RESULTS.md`](test/orin/RESULTS.md).
   drops out. A live but idle node (a pure timer or service node with no topic traffic) therefore
   reads as quiet. Re-initialising a node name does not duplicate its entry.
 - Requires tracing instrumentation compiled into the ROS build (the default on Humble and Isaac
-  debs; checkable at runtime with `ros_trace_compile_status()`).
-- Python (rclpy) nodes are counted on the publish side only. `rcl_publish` fires in the C layer,
-  so Python publishers are counted, but `callback_start` is rclcpp-only and rclpy was never
-  instrumented ([ros2_tracing#15](https://github.com/ros2/ros2_tracing/issues/15)), so a Python
-  subscriber's deliveries do not appear in `RECV` lines.
+  debs; checkable at runtime with `ros_trace_compile_status()`). The startup banner names the
+  tracetools version it found and warns if it is not one CI runs (4.x, 8.x, 9.x): tracepoints
+  are only promised stable within a distro.
+- Python (rclpy) and other non-rclcpp nodes are counted on both sides, through the C layers:
+  `rcl_publish` for publishes and the rmw's `rmw_take` tracepoint for receives (rclpy itself was
+  never instrumented, [ros2_tracing#15](https://github.com/ros2/ros2_tracing/issues/15)). The
+  receive side depends on the rmw emitting `rmw_take`: Cyclone DDS and Fast DDS do on every distro,
+  Connext only from Jazzy. On Humble, serialized and loaned takes (for example rosbag2 recording)
+  emit no tracepoint, so they are not counted for non-rclcpp subscribers.
+- Loaned-message counts (`LOAN` lines, `pub_loaned_hz` / `recv_loaned_hz`) come from wrapping
+  `rcl_publish_loaned_message` and `rcl_take_loaned_message`, not from a tracepoint. Those
+  signatures are stable within a distro and identical from Humble to Rolling today, but rcl does
+  not promise them across distros the way tracetools promises its tracepoints, so a future
+  distro that changed them would need a probe update. The real function is resolved through
+  `RTLD_NEXT`, or through the already-loaded librcl when a plugin loaded it `RTLD_LOCAL`; if
+  neither works, the probe warns once on stderr and returns `RCL_RET_ERROR` for that call
+  rather than crash. A loan is counted when rcl reports success; how each reader then gets the
+  sample is the middleware's business (Fast DDS data sharing only covers readers on the same
+  host, a remote reader still gets it over the network). On Humble, rclcpp refuses a loaned
+  publish on an intra-process publisher, so loans and intra-process never mix. Before this, a
+  loaned publisher on Humble had no `TOPIC` line at all: Humble's `rcl_publish_loaned_message`
+  fires no tracepoint.
 - File output only; no live network export, by design.
 
 ## Compatibility
