@@ -13,6 +13,14 @@
 // Hooking the tracetools layer (instead of rmw_*) is what lets us see INTRA-process traffic:
 // callback_start() fires for every subscription callback regardless of transport, carrying an
 // is_intra_process flag.
+//
+// callback_start is rclcpp-only. Every other rcl client (rclpy, rclc, ...) is counted one layer
+// down, at rmw_take: rcl_take() calls rmw_take_with_info(), and the rmw implementation emits
+// rmw_take(rmw_subscription_handle, message, source_timestamp, taken). rcl_take's own tracepoint
+// carries only the message pointer and fires even when nothing was taken, so it can be neither
+// attributed to a topic nor trusted as a receive. rcl_subscription_init links the rmw handle to
+// the topic, rclcpp_subscription_init marks a subscription as rclcpp's (counted at
+// callback_start instead), so one delivery is never counted twice.
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -27,29 +35,36 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 
 #include "ros2_pulse/core/env_config.hpp"
+#include "ros2_pulse/core/loan.hpp"
 #include "ros2_pulse/core/rate_spec.hpp"
 #include "ros2_pulse/core/timer.hpp"
 #include "ros2_pulse/core/topic_registry.hpp"
+#include "ros2_pulse/core/tracetools_version.hpp"
 #include "ros2_pulse/core/window_format.hpp"
 
 namespace {
 
 using ros2_pulse::core::defaultOutputPath;
 using ros2_pulse::core::eStatsFormat;
+using ros2_pulse::core::isTestedTracetoolsMajor;
 using ros2_pulse::core::evaluateRateSpecWarnings;
 using ros2_pulse::core::formatWindow;
 using ros2_pulse::core::formatWindowJsonl;
 using ros2_pulse::core::parseMaxBytes;
+using ros2_pulse::core::parsePackageVersion;
 using ros2_pulse::core::parsePeriodSeconds;
 using ros2_pulse::core::parseRateSpec;
 using ros2_pulse::core::parseStatsFormat;
 using ros2_pulse::core::readSpecFile;
+using ros2_pulse::core::tracetoolsPackageXmlPath;
+using ros2_pulse::core::versionMajor;
 using ros2_pulse::core::renderWarnLine;
 using ros2_pulse::core::sRateSpec;
 using ros2_pulse::core::sRateWarning;
@@ -123,6 +138,37 @@ auto loadRateSpec() -> std::optional<sRateSpec> {
     return spec;
 }
 
+// Version of the tracetools serving this process's hooks, from the package.xml next to the
+// libtracetools.so that defines the real ros_trace_rcl_node_init ("unknown" if any step fails).
+// Upstream keeps tracepoints stable within a distro and only deprecates across distros, so a
+// major CI never ran warns once on stderr; counting still proceeds. Runs once, in ensureStarted.
+auto detectTracetoolsVersion() -> std::string {
+    void* sym = dlsym(RTLD_NEXT, "ros_trace_rcl_node_init");
+    Dl_info info{};
+    if (sym == nullptr || dladdr(sym, &info) == 0 || info.dli_fname == nullptr) {
+        return "unknown";
+    }
+    const std::string xml_path = tracetoolsPackageXmlPath(info.dli_fname);
+    std::string xml;
+    std::string err;
+    if (xml_path.empty() || !readSpecFile(xml_path.c_str(), xml, err)) {
+        return "unknown";
+    }
+    auto version = parsePackageVersion(xml);
+    if (!version.has_value()) {
+        return "unknown";
+    }
+    const auto major = versionMajor(*version);
+    if (major.has_value() && !isTestedTracetoolsMajor(*major)) {
+        std::fprintf(stderr,
+                     "[ros2_pulse] tracetools %s is not a version this probe is tested on "
+                     "(4.x Humble, 8.x Jazzy to Lyrical, 9.x Rolling); counts may be wrong "
+                     "if its tracepoints changed\n",
+                     version->c_str());
+    }
+    return *version;
+}
+
 /// Process-wide probe runtime: the registry, the flush timer and output config.
 class ProbeRuntime {
 public:
@@ -158,6 +204,7 @@ public:
             // zero-rule no-op, a UTF-8 BOM failed a valid spec invisibly). A QUIET that also
             // swallowed diagnostics would reintroduce that class as a supported flag.
             // Pinned by test/integration/test_quiet.py.
+            const std::string tracetools = detectTracetoolsVersion();
             if (!m_quiet) {
                 char spec_desc[64];
                 if (m_spec.has_value()) {
@@ -167,10 +214,10 @@ public:
                     std::snprintf(spec_desc, sizeof(spec_desc), "none");
                 }
                 std::fprintf(stderr, "[ros2_pulse] active, interposing tracetools layer "
-                                     "(out=%s, format=%s, period=%.1fs, spec=%s, jitter=%s)\n",
+                                     "(out=%s, format=%s, period=%.1fs, spec=%s, jitter=%s, tracetools=%s)\n",
                              m_out_path.c_str(),
                              m_format == eStatsFormat::kJsonl ? "jsonl" : "text", m_period_s,
-                             spec_desc, m_registry.gapTracking() ? "on" : "off");
+                             spec_desc, m_registry.gapTracking() ? "on" : "off", tracetools.c_str());
             }
             // Counting effectively begins here (first tracepoint), stamp the window start
             // before the flush thread exists so the first window's denominator is measured
@@ -445,8 +492,9 @@ auto realFn(const char* name) -> Fn {
 }  // namespace
 
 // The library is compiled with -fvisibility=hidden (KNOWN_ISSUES #14) so nothing leaks into
-// the dynamic symbol table of every preloaded process; the seven interposers below are the
-// ONLY contract and are re-exported explicitly. test/integration/test_symbols.py pins this.
+// the dynamic symbol table of every preloaded process; the ros_trace_* interposers and the two
+// rcl loaned-message wrappers below are the ONLY contract and are re-exported explicitly.
+// test/integration/test_symbols.py pins this.
 #define ROS2_PULSE_EXPORT __attribute__((visibility("default")))
 
 extern "C" {
@@ -474,7 +522,8 @@ ROS2_PULSE_EXPORT void ros_trace_rcl_publisher_init(const void* pub_handle, cons
 ROS2_PULSE_EXPORT void ros_trace_rcl_subscription_init(const void* sub_handle, const void* node_handle,
                                      const void* rmw_sub, const char* topic, size_t depth) {
     ProbeRuntime::instance().ensureStarted();
-    ProbeRuntime::instance().registry().onSubscriptionInit(sub_handle, node_handle, topic);
+    ProbeRuntime::instance().registry().onSubscriptionInit(sub_handle, node_handle, topic,
+                                                           rmw_sub);
     static auto fn = realFn<void (*)(const void*, const void*, const void*, const char*, size_t)>(
         "ros_trace_rcl_subscription_init");
     if (fn) fn(sub_handle, node_handle, rmw_sub, topic, depth);
@@ -497,6 +546,10 @@ ROS2_PULSE_EXPORT void ros_trace_rclcpp_subscription_callback_added(const void* 
 
 ROS2_PULSE_EXPORT void ros_trace_rcl_publish(const void* pub_handle, const void* message) {
     ProbeRuntime::instance().registry().onPublish(pub_handle);
+    // Jazzy+ fires this tracepoint inside rcl_publish_loaned_message too: lets the loaned
+    // wrapper below learn (once per process) that the total is already counted. After that
+    // first loan, and in every process that never loans, this is one relaxed global load.
+    ros2_pulse::core::noteRclPublishTracepoint();
     static auto fn = realFn<void (*)(const void*, const void*)>("ros_trace_rcl_publish");
     if (fn) fn(pub_handle, message);
 }
@@ -512,10 +565,111 @@ ROS2_PULSE_EXPORT void ros_trace_rclcpp_intra_publish(const void* publisher_hand
     if (fn) fn(publisher_handle, message);
 }
 
+// Take-layer receive for every rcl client. Emitted by rmw_cyclonedds_cpp and rmw_fastrtps_*_cpp
+// on humble (typed takes; serialized and loaned takes emit nothing there), and by rmw_connextdds
+// and rmw_zenoh_cpp on newer distros. Fires on every take ATTEMPT; the registry returns on
+// taken=false before any lookup, and ignores rclcpp-owned subscriptions (see the file header).
+ROS2_PULSE_EXPORT void ros_trace_rmw_take(const void* rmw_subscription_handle, const void* message,
+                                          int64_t source_timestamp, const bool taken) {
+    ProbeRuntime::instance().registry().onTake(rmw_subscription_handle, taken);
+    static auto fn =
+        realFn<void (*)(const void*, const void*, int64_t, bool)>("ros_trace_rmw_take");
+    if (fn) fn(rmw_subscription_handle, message, source_timestamp, taken);
+}
+
 ROS2_PULSE_EXPORT void ros_trace_callback_start(const void* callback, bool is_intra_process) {
     ProbeRuntime::instance().registry().onCallbackStart(callback, is_intra_process);
     static auto fn = realFn<void (*)(const void*, bool)>("ros_trace_callback_start");
     if (fn) fn(callback, is_intra_process);
+}
+
+// ---- loaned messages: rcl functions, NOT tracepoints (rclcpp#3153 follow-up) ----
+//
+// At the tracepoint level a loan is indistinguishable from a copy: Jazzy+ fires the plain
+// rcl_publish tracepoint inside rcl_publish_loaned_message, the loaned take is traced (as plain
+// rcl_take) only on Rolling, and Humble traces neither, so on Humble a loaned publisher was
+// invisible to the probe altogether. rclcpp only calls these two functions when the publisher /
+// subscription reports can_loan_messages(); when the rmw cannot loan, LoanedMessage allocates
+// locally and publish() goes through plain rcl_publish instead. A successful call here is
+// therefore a real middleware loan. Both are reached through the caller's PLT (the publish from
+// rclcpp's header template inlined into the user binary, the take from librclcpp's executor),
+// so preload interposition sees them exactly like the ros_trace_* hooks.
+//
+// ABI caveat: unlike ros_trace_*, these are not a tracing contract. Their signatures are stable
+// within a distro and identical humble..rolling today, but are not promised across distros. The
+// wrappers use only opaque pointers and the int32_t rcl_ret_t, forward every argument verbatim,
+// and never dereference anything but the take's out-parameter after the real call succeeded.
+// The real symbol is found through RTLD_NEXT, or through the already-loaded librcl when that
+// was loaded RTLD_LOCAL (realRclSym). If neither finds it they warn once and return
+// RCL_RET_ERROR rather than crash (a caller can only reach them if librcl is loaded, so this is
+// defensive).
+
+namespace {
+constexpr int32_t kRclRetError = 1;  // RCL_RET_ERROR (rcl/types.h)
+
+// Resolve the real rcl function. RTLD_NEXT searches only the GLOBAL scope after the probe, so
+// it misses a librcl loaded RTLD_LOCAL: a plugin that links rcl, dlopen()ed by a host that does
+// not. That plugin's PLT still binds to the preloaded wrapper (the global scope is searched
+// first), so without this fallback the wrapper could not forward and would break a loaned
+// publish that works without the probe. dlopen(RTLD_NOLOAD) finds the already-loaded librcl by
+// soname wherever it was loaded; a handle lookup searches librcl's own scope, never the probe.
+// (Not a template: this sits inside the extern "C" block.)
+auto realRclSym(const char* name) -> void* {
+    if (void* p = dlsym(RTLD_NEXT, name)) {
+        return p;
+    }
+    void* h = dlopen("librcl.so", RTLD_LAZY | RTLD_NOLOAD);
+    if (h == nullptr) {
+        return nullptr;
+    }
+    void* p = dlsym(h, name);
+    dlclose(h);  // drops only the reference NOLOAD took; the caller's own dependency keeps it
+    return p;
+}
+
+void warnUnresolved(const char* name) {
+    static std::atomic<bool> warned{false};
+    bool expected = false;
+    if (warned.compare_exchange_strong(expected, true)) {
+        std::fprintf(stderr, "[ros2_pulse] cannot resolve real %s, loaned-message counting "
+                             "disabled for this call path\n", name);
+    }
+}
+}  // namespace
+
+ROS2_PULSE_EXPORT int32_t rcl_publish_loaned_message(const void* publisher, void* ros_message,
+                                                     void* allocation) {
+    using Fn = int32_t (*)(const void*, void*, void*);
+    static auto fn = reinterpret_cast<Fn>(realRclSym("rcl_publish_loaned_message"));
+    if (fn == nullptr) {
+        warnUnresolved("rcl_publish_loaned_message");
+        return kRclRetError;
+    }
+    // Learns once per process whether this librcl fires the plain rcl_publish tracepoint inside
+    // the loaned call (Jazzy+) or not (Humble), see core/loan.hpp.
+    bool counted_by_tracepoint = false;
+    const int32_t ret = ros2_pulse::core::forwardLoanedPublish(
+        [&] { return fn(publisher, ros_message, allocation); }, counted_by_tracepoint);
+    if (ros2_pulse::core::countLoanedPublish(ret)) {
+        ProbeRuntime::instance().registry().onLoanedPublish(publisher, counted_by_tracepoint);
+    }
+    return ret;
+}
+
+ROS2_PULSE_EXPORT int32_t rcl_take_loaned_message(const void* subscription, void** loaned_message,
+                                                  void* message_info, void* allocation) {
+    using Fn = int32_t (*)(const void*, void**, void*, void*);
+    static auto fn = reinterpret_cast<Fn>(realRclSym("rcl_take_loaned_message"));
+    if (fn == nullptr) {
+        warnUnresolved("rcl_take_loaned_message");
+        return kRclRetError;
+    }
+    const int32_t ret = fn(subscription, loaned_message, message_info, allocation);
+    if (loaned_message != nullptr &&
+        ros2_pulse::core::countLoanedTake(ret, *loaned_message)) {
+        ProbeRuntime::instance().registry().onLoanedTake(subscription);
+    }
+    return ret;
 }
 
 }  // extern "C"

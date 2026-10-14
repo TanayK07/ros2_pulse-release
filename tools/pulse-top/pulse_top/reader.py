@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import glob
 import os
+import tempfile
 
 
 class FileFollower:
@@ -33,7 +34,10 @@ class FileFollower:
         self._skip_partial = False
 
     def poll(self) -> list[str]:
-        """Return complete new lines since the last poll (without newlines)."""
+        """Return complete new lines since the last poll (without newlines).
+
+        Blank lines are kept: in the text format a blank line closes a window block,
+        and without it a text window would surface one period late (issue #58)."""
         try:
             size = os.path.getsize(self.path)
         except OSError:
@@ -61,7 +65,7 @@ class FileFollower:
         if self._skip_partial and lines:
             lines = lines[1:]
             self._skip_partial = False
-        return [ln.decode("utf-8", errors="replace") for ln in lines if ln]
+        return [ln.decode("utf-8", errors="replace") for ln in lines]
 
 
 class MultiFollower:
@@ -83,13 +87,28 @@ class MultiFollower:
         return sorted(self._followers)
 
     def poll(self) -> list[str]:
+        return [line for _, line in self.poll_tagged()]
+
+    def poll_tagged(self) -> list[tuple[str, str]]:
+        """New lines as (path, line): the file is the only provenance a record has
+        (jsonl carries no pid), and the recv_lag trackers are keyed by it."""
         if glob.has_magic(self.pattern):
             for path in glob.glob(self.pattern):
                 if path not in self._followers:
                     self._followers[path] = FileFollower(path)
         elif not self._followers:
             self._followers[self.pattern] = FileFollower(self.pattern)
-        out: list[str] = []
+        out: list[tuple[str, str]] = []
         for path in self.files:
-            out.extend(self._followers[path].poll())
+            out.extend((path, line) for line in self._followers[path].poll())
         return out
+
+
+def default_log_path() -> str | None:
+    """Glob for every per-process probe log, not the newest one: a live stack is
+    one file per node and the newest file is one node of it."""
+    for d in (os.environ.get("TMPDIR") or tempfile.gettempdir(), "/tmp"):
+        pattern = os.path.join(d, "topic_freq.*.log")
+        if glob.glob(pattern):
+            return pattern
+    return None

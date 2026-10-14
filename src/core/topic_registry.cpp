@@ -23,6 +23,16 @@ std::atomic<uint64_t> g_next_registry_id{1};
 sTopicCounter g_not_a_subscription;
 sTopicCounter* const kNotASubscription = &g_not_a_subscription;
 
+// Take-path sentinel: the rmw handle belongs to an rclcpp subscription, whose receives are
+// counted at callback_start, so the take is deliberately ignored (no double count). Same
+// identity-only contract as kNotASubscription, never dereferenced.
+sTopicCounter g_take_owned_by_rclcpp;
+sTopicCounter* const kTakeOwnedByRclcpp = &g_take_owned_by_rclcpp;
+// Take-path sentinel: an rmw handle no rcl_subscription_init ever named (the rmw's internal
+// discovery reader). Cached so repeat takes skip the lock; never dereferenced.
+sTopicCounter g_take_unknown_handle;
+sTopicCounter* const kTakeUnknownHandle = &g_take_unknown_handle;
+
 // Direct-mapped thread-local hot-path cache, shared by onPublish and onCallbackStart (publisher
 // handles and callback objects are distinct live allocations, so the key domains cannot
 // collide). A single-entry cache thrashed on the REALISTIC pattern, one thread alternating
@@ -179,7 +189,7 @@ void TopicRegistry::onPublisherInit(const void* pub_handle, const void* node_han
 }
 
 void TopicRegistry::onSubscriptionInit(const void* sub_handle, const void* node_handle,
-                                       const char* topic) {
+                                       const char* topic, const void* rmw_sub_handle) {
     if (sub_handle == nullptr || topic == nullptr) {
         return;
     }
@@ -187,6 +197,14 @@ void TopicRegistry::onSubscriptionInit(const void* sub_handle, const void* node_
     auto* counter = counterForTopic(topic);
     m_subhandle_to_counter[sub_handle] = counter;
     linkNodeCounter(node_handle, counter);
+    // A fresh rcl subscription: ownership is unknown until rclcpp_subscription_init (rclcpp
+    // fires it right after rcl init, in the Subscription ctor, before any executor can take).
+    // Resetting here also covers a recycled rcl handle that used to be rclcpp's.
+    m_subhandle_rclcpp[sub_handle] = false;
+    if (rmw_sub_handle != nullptr) {
+        m_rmwsub_to_subhandle[rmw_sub_handle] = sub_handle;
+    }
+    m_sub_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 
 void TopicRegistry::onRclcppSubscriptionInit(const void* subscription, const void* sub_handle) {
@@ -195,6 +213,8 @@ void TopicRegistry::onRclcppSubscriptionInit(const void* subscription, const voi
     }
     std::unique_lock<std::shared_mutex> lock(m_mu);
     m_sub_to_subhandle[subscription] = sub_handle;
+    m_subhandle_rclcpp[sub_handle] = true;
+    m_sub_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 
 void TopicRegistry::onCallbackAdded(const void* callback, const void* subscription) {
@@ -303,6 +323,53 @@ void TopicRegistry::publishCount(const void* pub_handle, bool is_intra_process) 
     }
 }
 
+auto TopicRegistry::lookupHandle(const void* handle,
+                                 const std::unordered_map<const void*, sTopicCounter*>& map)
+    -> sTopicCounter* {
+    sTlsSlot& slot = tlsSlotFor(handle);
+    if (slot.id == m_id && slot.key == handle && slot.ctr != kNotASubscription) {
+        return slot.ctr;
+    }
+    std::shared_lock<std::shared_mutex> lock(m_mu);
+    m_shared_lock_lookups.fetch_add(1, std::memory_order_relaxed);
+    auto it = map.find(handle);
+    if (it == map.end()) {
+        return nullptr;
+    }
+    slot = {m_id, handle, it->second};
+    return it->second;
+}
+
+void TopicRegistry::onLoanedPublish(const void* pub_handle, bool counted_by_tracepoint) {
+    if (pub_handle == nullptr) {
+        return;
+    }
+    sTopicCounter* c = lookupHandle(pub_handle, m_pub_to_counter);
+    if (c == nullptr) {
+        return;
+    }
+    c->pub_loaned.fetch_add(1, std::memory_order_relaxed);
+    if (!counted_by_tracepoint) {
+        // Humble: no tracepoint fired inside rcl_publish_loaned_message, so this IS the only
+        // signal for the publish. Count it in the total (and the gap accumulator) here, exactly
+        // as onPublish would have.
+        c->pub_inter.fetch_add(1, std::memory_order_relaxed);
+        if (m_gap_tracking.load(std::memory_order_relaxed)) {
+            noteArrival(c->pub_last_ns, c->pub_max_dt_ns);
+        }
+    }
+}
+
+void TopicRegistry::onLoanedTake(const void* sub_handle) {
+    if (sub_handle == nullptr) {
+        return;
+    }
+    sTopicCounter* c = lookupHandle(sub_handle, m_subhandle_to_counter);
+    if (c != nullptr) {
+        c->recv_loaned.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void TopicRegistry::onCallbackStart(const void* callback, bool is_intra_process) {
     if (callback == nullptr) {
         return;
@@ -362,6 +429,73 @@ void TopicRegistry::onCallbackStart(const void* callback, bool is_intra_process)
     }
 }
 
+auto TopicRegistry::takeTag() const -> uint64_t {
+    // m_id >= 1 occupies the high word, so a take tag never equals a plain m_id tag (and the key
+    // domains are disjoint anyway: rmw handles are distinct live allocations from rcl publisher
+    // handles and rclcpp callback objects).
+    return (m_id << 32) | m_sub_epoch.load(std::memory_order_relaxed);
+}
+
+auto TopicRegistry::resolveTake(const void* rmw_sub_handle) const -> sTopicCounter* {
+    auto r = m_rmwsub_to_subhandle.find(rmw_sub_handle);
+    if (r == m_rmwsub_to_subhandle.end()) {
+        return nullptr;  // never initialized through rcl, nothing to attribute it to
+    }
+    auto own = m_subhandle_rclcpp.find(r->second);
+    if (own != m_subhandle_rclcpp.end() && own->second) {
+        return kTakeOwnedByRclcpp;
+    }
+    auto c = m_subhandle_to_counter.find(r->second);
+    return c == m_subhandle_to_counter.end() ? nullptr : c->second;
+}
+
+void TopicRegistry::onTake(const void* rmw_sub_handle, bool taken) {
+    // rmw_take fires for every take ATTEMPT (both Humble DDS rmws emit it before the caller
+    // looks at the result); only a taken message is a receive. Cheapest possible reject.
+    if (!taken || rmw_sub_handle == nullptr) {
+        return;
+    }
+    // Tag read BEFORE the lookup: an init racing with this take bumps the epoch, so whatever we
+    // cache below carries the old tag and is re-resolved on the next take (conservative).
+    const uint64_t tag = takeTag();
+    sTlsSlot& slot = tlsSlotFor(rmw_sub_handle);
+    sTopicCounter* ctr = nullptr;
+    if (slot.id == tag && slot.key == rmw_sub_handle) {
+        ctr = slot.ctr;
+    } else {
+        bool prove_endpoint = false;
+        {
+            std::shared_lock<std::shared_mutex> lock(m_mu);
+            m_shared_lock_lookups.fetch_add(1, std::memory_order_relaxed);
+            ctr = resolveTake(rmw_sub_handle);
+            prove_endpoint = ctr != nullptr && ctr != kTakeOwnedByRclcpp &&
+                             !ctr->recv_endpoint_seen;
+        }
+        if (ctr == nullptr) {
+            // Unknown handle: the rmw's own internal readers (ros_discovery_info) take through
+            // the same tracepoint but never pass rcl_subscription_init. Cache the miss so that
+            // steady discovery traffic stays off the lock too; the epoch in the tag re-resolves
+            // it if this address is later initialized as a real subscription.
+            ctr = kTakeUnknownHandle;
+        }
+        if (prove_endpoint) {
+            // First delivered take for this topic: mark it a proven receive endpoint so a later
+            // stall reads RECV 0.0 (KNOWN_ISSUES #12). recv_endpoint_seen is a plain bool written
+            // only under the exclusive lock; once per topic, so this escalation is cold.
+            std::unique_lock<std::shared_mutex> lock(m_mu);
+            ctr->recv_endpoint_seen = true;
+        }
+        slot = {tag, rmw_sub_handle, ctr};
+    }
+    if (ctr == kTakeOwnedByRclcpp || ctr == kTakeUnknownHandle) {
+        return;  // rclcpp subscription (callback_start counts it) or rmw-internal reader
+    }
+    ctr->recv_inter.fetch_add(1, std::memory_order_relaxed);
+    if (m_gap_tracking.load(std::memory_order_relaxed)) {
+        noteArrival(ctr->recv_last_ns, ctr->recv_max_dt_ns);
+    }
+}
+
 auto TopicRegistry::snapshot(double window_s, bool fold_open_gap)
     -> std::vector<sTopicStat> {
     std::vector<sTopicStat> out;
@@ -378,12 +512,14 @@ auto TopicRegistry::snapshot(double window_s, bool fold_open_gap)
     std::unordered_set<const sTopicCounter*> active;
     for (auto& kv : m_by_topic) {
         sTopicCounter* c = kv.second.get();
-        // Exchange all three split buckets first (this also resets them), so filtered topics still
+        // Exchange all split buckets first (this also resets them), so filtered topics still
         // count toward node activity even though they are excluded from the stats output.
         uint64_t p = c->pub_inter.exchange(0, std::memory_order_relaxed);
         uint64_t px = c->pub_intra.exchange(0, std::memory_order_relaxed);
         uint64_t ri = c->recv_inter.exchange(0, std::memory_order_relaxed);
         uint64_t rx = c->recv_intra.exchange(0, std::memory_order_relaxed);
+        uint64_t pl = c->pub_loaned.exchange(0, std::memory_order_relaxed);
+        uint64_t rl = c->recv_loaned.exchange(0, std::memory_order_relaxed);
         // Gap accumulators drain here too, for the same reason the counts do: a filtered topic
         // is not REPORTED, but its per-window state must still be reset or it ratchets upward
         // for the process lifetime and the first window after any filter change would report a
@@ -398,7 +534,7 @@ auto TopicRegistry::snapshot(double window_s, bool fold_open_gap)
             has_recv_gap = takeGap(c->recv_last_ns, c->recv_max_dt_ns, now_ns, fold_open_gap,
                                    recv_gap_ms);
         }
-        if (p > 0 || px > 0 || ri > 0 || rx > 0) {
+        if (p > 0 || px > 0 || ri > 0 || rx > 0 || pl > 0 || rl > 0) {
             active.insert(c);  // this topic's endpoints saw traffic -> owning node(s) are live
         }
         if (shouldFilter(c->topic)) {
@@ -414,6 +550,10 @@ auto TopicRegistry::snapshot(double window_s, bool fold_open_gap)
         s.pub_intra_hz = static_cast<double>(px) / w;
         s.recv_inter_hz = static_cast<double>(ri) / w;
         s.recv_intra_hz = static_cast<double>(rx) / w;
+        s.pub_loaned_count = pl;
+        s.recv_loaned_count = rl;
+        s.pub_loaned_hz = static_cast<double>(pl) / w;
+        s.recv_loaned_hz = static_cast<double>(rl) / w;
         s.recv_endpoint_seen = c->recv_endpoint_seen;
         s.has_pub_max_dt = has_pub_gap;
         s.pub_max_dt_ms = pub_gap_ms;
