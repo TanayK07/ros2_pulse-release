@@ -25,6 +25,8 @@ namespace ros2_pulse::core {
 /// LOAN <topic> recv hz=<recv_loaned_hz to 6dp> // when recv_loaned_count>0 (subset of RECV)
 /// NODE <node>
 /// WARN ...                                     // one line per entry of @p warnings, verbatim
+/// EP <topic> <pub|recv> id=<n> node=<node> inter=<hz> intra=<hz> [max_dt_ms=<ms>] [loaned_hz=<hz>]
+///                                              // only when @p endpoints is non-null
 /// <blank line>
 /// @endcode
 ///
@@ -35,11 +37,18 @@ namespace ros2_pulse::core {
 /// they are emitted verbatim after the NODE lines so existing TOPIC/PUB/RECV/NODE parsers are
 /// unaffected. Empty by default, the output is then byte-identical to the pre-R1 format.
 ///
+/// @p endpoints (the per-publisher / per-subscription split, opt-in in text via
+/// ROS_TOPIC_STATS_ENDPOINTS=1) adds one EP line per endpoint that passes
+/// TopicRegistry::shouldEmitEndpoint, LAST in the block so every older line kind keeps its
+/// position. `node=` is omitted when the owning node is unknown; `max_dt_ms=` / `loaned_hz=` only
+/// when measured. nullptr (the default) keeps the output byte-identical to the pre-EP format.
+///
 /// Pure (no ROS / tracetools / I/O dependency) so the probe can build the whole window once and
 /// write it with a single call, and so the exact format is unit-testable.
 auto formatWindow(const std::vector<sTopicStat>& stats, const std::vector<std::string>& nodes,
                   long long ts_ns, double window_s, bool emit_idle,
-                  const std::vector<std::string>& warnings = {}) -> std::string;
+                  const std::vector<std::string>& warnings = {},
+                  const std::vector<sEndpointStat>* endpoints = nullptr) -> std::string;
 
 /// @brief Render one flush window as ONE JSON Lines record (ROS_TOPIC_STATS_FORMAT=jsonl,
 /// ROADMAP R6): a single JSON object on a single line, '\n'-terminated, UTF-8, per
@@ -47,15 +56,36 @@ auto formatWindow(const std::vector<sTopicStat>& stats, const std::vector<std::s
 ///
 /// Shape (exact bytes pinned by test_window_format_jsonl.cpp golden tests):
 /// @code
-/// {"ts_ns":"<int64>","window_s":W.WWW,
+/// {"ts_ns":"<int64>","window_s":W.WWW,"partial":true,
 ///  "topics":[{"topic":"/x","pub_inter_hz":N,"pub_intra_hz":N,
 ///             "recv_inter_hz":N,"recv_intra_hz":N,"recv_endpoint_seen":true,
-///             "pub_max_dt_ms":N,"recv_max_dt_ms":N,"pub_loaned_hz":N,"recv_loaned_hz":N}, ...],
+///             "pub_max_dt_ms":N,"recv_max_dt_ms":N,"recv_min_dt_ms":N,"recv_stddev_dt_ms":N,
+///             "recv_age_avg_ms":N,"recv_age_min_ms":N,"recv_age_max_ms":N,
+///             "recv_age_stddev_ms":N,"recv_age_count":N,
+///             "pub_loaned_hz":N,"recv_loaned_hz":N}, ...],
 ///  "nodes":["/a", ...],
 ///  "warns":[{"kind":"topic_rate","topic":"/x","hz":N,"min_hz":N,"max_hz":N},
 ///           {"kind":"topic_gap","topic":"/x","max_dt_ms":N,"max_gap_ms":N},
-///           {"kind":"node_missing","node":"/a"}, ...]}
+///           {"kind":"node_missing","node":"/a"}, ...],
+///  "endpoints":[{"topic":"/x","side":"pub","id":3,"node":"/a","inter_hz":N,"intra_hz":N,
+///                "max_dt_ms":N,"avg_dt_ms":N,"min_dt_ms":N,"stddev_dt_ms":N,"dt_count":N,
+///                "age_avg_ms":N,"age_min_ms":N,"age_max_ms":N,"age_stddev_ms":N,
+///                "age_count":N,"loaned_hz":N}, ...]}
 /// @endcode
+///
+/// `endpoints` is the per-publisher / per-subscription split of the `topics` sums, one element
+/// per endpoint passing TopicRegistry::shouldEmitEndpoint: `side` is "pub" or "recv", `id` is the
+/// probe's process-unique endpoint id, `node` the owning node (absent when unknown), and
+/// `max_dt_ms` / `loaned_hz` follow the same absence-means-unmeasured rule as the topic keys, as
+/// do a subscription's own receive distributions (`*_dt_*` / `age_*`, gap tracking on only).
+/// The key is written only when @p endpoints is non-null (the probe always passes it, so the
+/// probe's records always carry it, empty or not); a reader must treat its absence as "older
+/// probe", never as "no endpoints".
+///
+/// `"partial":true` (only when @p partial) marks a lifecycle window the probe does not judge
+/// alerts on: the first one after attach, whose rates are diluted by the time before traffic
+/// started, and the one written at exit. Absent means a full window (or an older probe). jsonl
+/// only: the text header is sscanf'd by more readers than this repo's.
 ///
 /// Design decisions, each mirrored from the text format or from exporter prior art:
 ///  - `ts_ns` is a decimal STRING, not a JSON number: epoch nanoseconds (~1.8e18) exceed
@@ -83,7 +113,12 @@ auto formatWindow(const std::vector<sTopicStat>& stats, const std::vector<std::s
 /// with a single call, and the exact bytes stay unit-testable.
 auto formatWindowJsonl(const std::vector<sTopicStat>& stats, const std::vector<std::string>& nodes,
                        long long ts_ns, double window_s, bool emit_idle,
-                       const std::vector<sRateWarning>& warnings = {}) -> std::string;
+                       const std::vector<sRateWarning>& warnings = {},
+                       const std::vector<sEndpointStat>* endpoints = nullptr,
+                       bool partial = false) -> std::string;
+
+/// "pub" / "recv": the side token both formats use for an endpoint (and JITTER / LOAN lines).
+auto endpointSideName(eEndpointSide side) -> const char*;
 
 /// @brief Per-process default output path: `$TMPDIR/topic_freq.<pid>.log`, `/tmp` fallback.
 ///
