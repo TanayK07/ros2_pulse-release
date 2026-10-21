@@ -5,6 +5,128 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-21
+
+/diagnostics for diagnostic_aggregator, the rest of rclcpp's removed topic statistics (MINIMUM, STDDEV, message_age), graph-monitor messages, per-endpoint counts, and a package guide on docs.ros.org. pulse-top 0.6.0 reads the endpoint fields.
+
+### Changed
+- **The probe counts per publisher and per subscription, attributed to the owning node.**
+  Counters used to be keyed by topic per process, so every endpoint of a topic in one process
+  shared one counter. Two subscriptions on one topic (a component container, or one node
+  subscribing twice) interleaved one inter-arrival stream, two subscriptions of one node summed
+  into one rate, and every node's `/rosout` and `/parameter_events` endpoints shared one counter,
+  so one node's log line kept every node of the process in the `NODE` list (found in the #68 and
+  #70 reviews). Each rcl publisher handle and rcl subscription handle now has its own counter,
+  attributed to the node whose handle its init carried (including the `/rosout` publisher rcl
+  creates before `rcl_node_init`'s tracepoint fires). The hot path is still one relaxed add, on
+  the handle's own counter; the per-topic `TOPIC` / `PUB` / `RECV` / `LOAN` rates are summed at
+  flush time and are unchanged, and the per-topic `JITTER` gap keeps measuring the gap between
+  any two messages of the topic. With gap tracking on, each arrival also updates its handle's
+  own gap from the same clock read (one more atomic exchange). Node liveness now looks only at a
+  node's own endpoints. A publisher or subscription address reused after a destroy re-homes its
+  endpoint, which also stops a recycled publisher handle from counting into its previous topic.
+- **Destroyed publishers, subscriptions and nodes are retired.** There is no destroy tracepoint,
+  so the probe now also wraps `rcl_publisher_fini`, `rcl_subscription_fini` and `rcl_node_fini`
+  by name (graph-rate calls, the per-message path is unchanged). A destroyed endpoint is written
+  once more if its last window carried traffic, then dropped; before, a subscription removed in a
+  lifecycle `on_cleanup` (or by unloading a component) stayed in every window as a stalled
+  `inter=0.0` endpoint of a live node, and a destroyed publisher's open gap grew without bound
+  with gap tracking on. A node address reused by the next node no longer hands that node the
+  destroyed node's endpoints: only the new node's own pre-init `/rosout` publisher is claimed.
+  A callback address reused by a re-created subscription is re-resolved (its endpoint is proven
+  again for KNOWN_ISSUES #12, and counts no longer go to the destroyed subscription), and the
+  thread-local cache is tagged by kind, so a publisher handle address reused as a subscription
+  handle (or the reverse) is never served the other one's endpoint (PR #72 review).
+
+### Added
+- **`pulse_bridge` publishes `/diagnostics` (`diagnostics:=true`).** One
+  `diagnostic_msgs/DiagnosticArray` per poll for `diagnostic_aggregator`: a status per
+  expected-rate rule (`ros2_pulse: /scan (recv)`, `WARN` while the probe warns `topic_rate` or
+  `topic_gap` for it, with `hz`, the rule's bounds and the measured gap as values), per spec node
+  (`ERROR` on `node_missing`), and per log (`ERROR` `stale` once no window arrived for two
+  window periods plus a poll; a log whose latest window is the probe's exit window is dropped
+  instead, a clean exit is not a fault). The levels come from the probe's `warns`; the bridge reads the
+  spec (`expected_file`, default `$ROS_TOPIC_STATS_EXPECTED`) only to know the rules, so a rule
+  that holds reports `OK`. New parameters: `diagnostics`, `diagnostics_topic`, `hardware_id`,
+  `diagnostics_all_topics` (also report topics without a rule), `expected_file`. `package.xml`
+  now declares `diagnostic_msgs`. The jsonl reader (`sLogWindow::warns`) now parses `warns`;
+  `pulse-check` still ignores them and judges the raw rates.
+- **Per-endpoint breakdown in the output, additive.** jsonl records gain an `endpoints` array
+  (always present in probe output): one entry per publisher / subscription with `topic`,
+  `side` (`pub` / `recv`), a process-unique `id`, `node` (absent when unknown), `inter_hz`,
+  `intra_hz`, and `max_dt_ms` / `loaned_hz` when measured. Text windows get the same as `EP`
+  lines with the new `ROS_TOPIC_STATS_ENDPOINTS=1`; without it the text output is unchanged.
+  Same emit gates as the topic lines; filtered topics stay filtered. `pulse-check`'s reader
+  (and so `pulse_bridge`) parses both into `sLogWindow::endpoints`; pulse-top parses them into
+  `Window.endpoints` and treats `EP` as a known line kind. One malformed `endpoints` element
+  costs pulse-top that element only, never the window. Text `EP` lines need pulse-top
+  0.6.0: pulse-top / `pulse-export` 0.5.0 count each `EP` line as a skipped line
+  (`ros2_pulse_lines_skipped_total`); jsonl works with 0.5.0, which ignores the key.
+- **`pulse_bridge` publishes the rest of what rclcpp's built-in topic statistics did.** Those
+  were removed from Rolling by [rclcpp#3203](https://github.com/ros2/rclcpp/pull/3203). With
+  `ROS_TOPIC_STATS_JITTER=1`, `message_period` messages now carry `MINIMUM` and `STDDEV` of the
+  received inter-arrival period next to `AVERAGE`, `MAXIMUM` and `SAMPLE_COUNT`, in
+  libstatistics_collector's order (`AVERAGE`, `MAXIMUM`, `MINIMUM`, `SAMPLE_COUNT`, `STDDEV`).
+  With `metrics_source:=metric` every message carries all five points, NaN when unmeasured, as
+  upstream did; the default topic layout leaves an unmeasured point out. The probe keeps the
+  minimum and the running sums for these per subscription, next to that subscription's own gap
+  accumulator, and pools them per topic at flush time, so two subscriptions on one topic never
+  interleave their intervals: lock-free, about +3 ns per receive, and only while gap tracking is
+  on.
+- **`message_age`.** The `rmw_take` hook now also reads the DDS source timestamp it already
+  received, and with gap tracking on records local wall clock minus that timestamp per
+  inter-process take, for rclcpp subscriptions too (their receive is still counted at
+  `callback_start`). The new `metrics_source:=metric` bridge parameter publishes it as rclcpp
+  did: `metrics_source` is `message_age` / `message_period` (in that order, one pair per
+  receive-side topic, `message_age` empty with `SAMPLE_COUNT` 0 when unmeasured; publisher-only
+  topics are left out), `measurement_source_name` the node.
+  This matches rclcpp Jazzy+ (`now - message_info.source_timestamp`, negative ages from a
+  publisher whose clock runs ahead are kept); Humble / Iron rclcpp used `header.stamp`, which
+  needs the message type.
+  Intra-process deliveries never reach `rmw_take` and carry no age, with one exception: with
+  intra-process comms on and a remote subscriber present, the DDS copy that rclcpp takes and
+  discards in the same-process subscription is still age-sampled at `rmw_take` (counts and the
+  receive period are unaffected). Cost: one wall-clock read per take with a source timestamp,
+  about +26 ns on x86-64.
+- jsonl topic entries gain `recv_min_dt_ms`, `recv_stddev_dt_ms` and `recv_age_avg_ms` /
+  `recv_age_min_ms` / `recv_age_max_ms` / `recv_age_stddev_ms` / `recv_age_count`, each group
+  only when measured. The text format is unchanged. `recv_age_stddev_ms` (and the age `STDDEV`
+  point) is dropped for a window whose ages spread over more than ~71 min rather than reported
+  wrapped; a constant cross-host clock skew does not affect it.
+- jsonl `endpoints` entries of a subscription gain its own receive distributions, the
+  per-subscription twins of the topic keys above: `avg_dt_ms` / `min_dt_ms` / `stddev_dt_ms` /
+  `dt_count` and `age_avg_ms` / `age_min_ms` / `age_max_ms` / `age_stddev_ms` / `age_count`, each
+  group only when measured (gap tracking on). Drained from the accumulators the topic already
+  pools, at flush time; the hot path is unchanged. Text `EP` lines are unchanged.
+- jsonl windows gain `"partial":true` on the probe's first window after attach and its exit
+  window, the two it already grace-skips for alerts (absent otherwise, so existing records are
+  byte-identical). `pulse-check`'s reader parses it into `sLogWindow::partial`; pulse-top
+  ignores it. The text format is unchanged.
+- **pulse_bridge: `rosgraph_monitor_msgs/TopicStatistics` for graph-monitor
+  ([graph-monitor#14](https://github.com/ros-tooling/graph-monitor/issues/14)).** With
+  `graph_monitor:=true` the bridge also publishes each window on `/topic_statistics`
+  (`graph_monitor_topic`): `PUBLISHED_PERIOD` / `RECEIVED_PERIOD` per (node, topic), with
+  `window_count`, `mean` = 1 / rate and `max` = largest gap when jitter tracking is on. With
+  jitter tracking on, `RECEIVED_PERIOD` takes `mean` / `min` from the subscription's own
+  interval distribution and `TAKE_AGE` carries its message age (mean / min / max, a negative
+  age sent as 0); `PUBLISHED_PERIOD` `min` stays 0 (not tracked). Each endpoint is reported
+  under its owning node from the per-endpoint split, so a component container reports every
+  node; two handles of one node on one topic and side report the slower one, not the sum. A
+  partial window sends no `PUBLISHED_PERIOD`, and `RECEIVED_PERIOD` only from a measured
+  interval mean. Messages are stamped with the bridge's system clock at publish, like
+  graph-monitor's shim, and the bridge warns once per log when `window_s` + `poll_period_s`
+  reaches graph-monitor's stale timeout (`graph_monitor_stale_timeout_ms`, 3000 by default);
+  the README example sets `ROS_TOPIC_STATISTICS_PUBLISH_PERIOD=1`. A log without the split (an
+  older probe) falls back to per-process sums, and a process with several active nodes is then
+  skipped with a warning, repeated at most once a minute (PR #68 review). Off by default;
+  `rosgraph_monitor_msgs` is a new `<depend>` found `QUIET`, so a source build without it still
+  builds the bridge. Mapping in the pure core (`topic_statistic_mapper`), 30 unit tests, 6
+  bridge integration tests.
+- **A package guide on docs.ros.org.** `doc/` and `rosdoc2.yaml` replace the generated page of
+  internal C++ structs with a quickstart and reference pages, and `package.xml` declares the
+  `ros2_documentation_area` export so the ROS 2 docs can list the package on their
+  introspection pages (ros2_documentation#7240).
+
 ## [0.6.0] - 2026-10-14
 
 Receive rates for rclpy nodes, loaned-message counts, and the tracetools version in the banner. pulse-top 0.5.0 reads the loan fields.
