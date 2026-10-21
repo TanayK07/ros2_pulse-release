@@ -1,0 +1,13 @@
+Source: ros-lyrical-ros2-pulse
+Section: misc
+Priority: optional
+Maintainer: "Tanay Kedia" <95276223+TanayK07@users.noreply.github.com>
+Build-Depends: debhelper (>= 9.0.0), lttng-tools <!nocheck>, ros-lyrical-ament-cmake, ros-lyrical-ament-cmake-gtest <!nocheck>, ros-lyrical-ament-cmake-pytest <!nocheck>, ros-lyrical-diagnostic-msgs, ros-lyrical-rcl <!nocheck>, ros-lyrical-rclcpp, ros-lyrical-rclpy <!nocheck>, ros-lyrical-ros2run <!nocheck>, ros-lyrical-rosgraph-monitor-msgs, ros-lyrical-statistics-msgs, ros-lyrical-std-msgs <!nocheck>, ros-lyrical-ros-workspace
+Homepage: https://tanayk07.github.io/ros2_pulse/
+Standards-Version: 3.9.2
+
+Package: ros-lyrical-ros2-pulse
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ros-lyrical-diagnostic-msgs, ros-lyrical-rclcpp, ros-lyrical-rosgraph-monitor-msgs, ros-lyrical-statistics-msgs, ros-lyrical-ros-workspace
+Description: Near-zero-overhead ROS 2 probe for per-topic message frequency and active-node liveness, covering both inter-process and intra-process traffic.
+ Works on stock ROS 2 binaries via an LD_PRELOAD shim over the tracetools instrumentation layer: no patched rmw_implementation, no ROS recompile, no privileges, and no DDS traffic.
