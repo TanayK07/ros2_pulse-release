@@ -1,0 +1,13 @@
+Source: ros-rolling-ros2-pulse
+Section: misc
+Priority: optional
+Maintainer: "Tanay Kedia" <95276223+TanayK07@users.noreply.github.com>
+Build-Depends: debhelper (>= 9.0.0), lttng-tools <!nocheck>, ros-rolling-ament-cmake, ros-rolling-ament-cmake-gtest <!nocheck>, ros-rolling-ament-cmake-pytest <!nocheck>, ros-rolling-diagnostic-msgs, ros-rolling-rcl <!nocheck>, ros-rolling-rclcpp, ros-rolling-rclpy <!nocheck>, ros-rolling-ros2run <!nocheck>, ros-rolling-rosgraph-monitor-msgs, ros-rolling-statistics-msgs, ros-rolling-std-msgs <!nocheck>, ros-rolling-ros-workspace
+Homepage: https://tanayk07.github.io/ros2_pulse/
+Standards-Version: 3.9.2
+
+Package: ros-rolling-ros2-pulse
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ros-rolling-diagnostic-msgs, ros-rolling-rclcpp, ros-rolling-rosgraph-monitor-msgs, ros-rolling-statistics-msgs, ros-rolling-ros-workspace
+Description: Near-zero-overhead ROS 2 probe for per-topic message frequency and active-node liveness, covering both inter-process and intra-process traffic.
+ Works on stock ROS 2 binaries via an LD_PRELOAD shim over the tracetools instrumentation layer: no patched rmw_implementation, no ROS recompile, no privileges, and no DDS traffic.
