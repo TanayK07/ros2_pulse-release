@@ -1,3 +1,26 @@
+## ros2_pulse (lyrical) - 0.7.0-1
+
+The packages in the `ros2_pulse` repository were released into the `lyrical` distro by running `/home/tanay/.local/bin/bloom-release --rosdistro lyrical --track lyrical ros2_pulse -y --no-web --no-pull-request --override-release-repository-url https://github.com/TanayK07/ros2_pulse-release.git --override-release-repository-push-url https://github.com/TanayK07/ros2_pulse-release.git` on `Wed, 21 Oct 2026 08:41:56 -0000`
+
+The `ros2_pulse` package was released.
+
+Version of package(s) in repository `ros2_pulse`:
+
+- upstream repository: https://github.com/TanayK07/ros2_pulse.git
+- release repository: unknown
+- rosdistro version: `null`
+- old version: `None-0`
+- new version: `0.7.0-1`
+
+Versions of tools used:
+
+- bloom version: `0.14.3`
+- catkin_pkg version: `1.1.0`
+- rosdep version: `0.26.0`
+- rosdistro version: `1.0.1`
+- vcstools version: `0.1.42`
+
+
 ## ros2_pulse (rolling) - 0.7.0-1
 
 The packages in the `ros2_pulse` repository were released into the `rolling` distro by running `/home/tanay/.local/bin/bloom-release --rosdistro rolling --track rolling ros2_pulse -y --no-web --no-pull-request --override-release-repository-url https://github.com/TanayK07/ros2_pulse-release.git --override-release-repository-push-url https://github.com/TanayK07/ros2_pulse-release.git` on `Wed, 21 Oct 2026 08:40:36 -0000`
