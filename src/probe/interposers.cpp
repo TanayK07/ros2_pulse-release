@@ -332,6 +332,10 @@ private:
           // opt-in as every other flag: QUIET=true/yes/0 keep the banner, so a half-set flag
           // fails loud (banner still there) instead of half-silencing.
           m_quiet(envFlag("ROS_TOPIC_STATS_QUIET")),
+          // Per-endpoint EP lines in the TEXT format. Opt-in: the default text output stays
+          // byte-identical for every existing parser (jsonl carries the split unconditionally,
+          // as an additive key).
+          m_endpoints_text(envFlag("ROS_TOPIC_STATS_ENDPOINTS")),
           m_spec(loadRateSpec()) {
         // Output format (ROADMAP R6). Parsed in the ctor BODY so the unknown-value warning can
         // show the offending text. The ctor runs exactly once (tracepoint-reached singleton),
@@ -381,7 +385,10 @@ private:
         // max, EXCEPT on the exit window, rclcpp teardown stops traffic before the
         // process exits, so the open gap there measures the shutdown sequence and would
         // fire every max_gap_ms rule on a perfectly healthy stop.
-        auto stats = m_registry.snapshot(window_s, /*fold_open_gap=*/!exiting);
+        // One drain yields both the per-topic sums and the per-endpoint split they were summed
+        // from, so the two views of a window can never disagree.
+        auto snap = m_registry.snapshotWindow(window_s, /*fold_open_gap=*/!exiting);
+        const auto& stats = snap.topics;
         auto nodes = m_registry.activeNodes();
         if (stats.empty() && nodes.empty()) {
             return;
@@ -413,8 +420,12 @@ private:
         }
         std::string block;
         if (m_format == eStatsFormat::kJsonl) {
+            // jsonl always carries the per-endpoint split: an additive key every reader skips.
+            // The windows grace-skipped above are flagged partial for consumers (pulse_bridge's
+            // graph-monitor output) that would otherwise read their rates as the real ones.
+            const bool partial = window_index == 0 || exiting;
             block = formatWindowJsonl(stats, nodes, static_cast<long long>(ns), window_s,
-                                      m_emit_idle, warnings);
+                                      m_emit_idle, warnings, &snap.endpoints, partial);
         } else {
             std::vector<std::string> warn_lines;
             warn_lines.reserve(warnings.size());
@@ -422,7 +433,8 @@ private:
                 warn_lines.push_back(renderWarnLine(w));
             }
             block = formatWindow(stats, nodes, static_cast<long long>(ns), window_s,
-                                 m_emit_idle, warn_lines);
+                                 m_emit_idle, warn_lines,
+                                 m_endpoints_text ? &snap.endpoints : nullptr);
         }
 
         rotateIfNeeded();
@@ -471,6 +483,8 @@ private:
     // ROS_TOPIC_STATS_QUIET=1: suppress the informational banner (never diagnostics, see
     // the rationale block in ensureStarted()).
     bool m_quiet;
+    // ROS_TOPIC_STATS_ENDPOINTS=1: append EP lines (per publisher / subscription) to text windows.
+    bool m_endpoints_text;
     // Output format (R6): text (default, byte-identical to pre-R6) or jsonl. Set once in the
     // ctor; an unrecognized value warned about there and fell back to text.
     eStatsFormat m_format{eStatsFormat::kText};
@@ -492,8 +506,9 @@ auto realFn(const char* name) -> Fn {
 }  // namespace
 
 // The library is compiled with -fvisibility=hidden (KNOWN_ISSUES #14) so nothing leaks into
-// the dynamic symbol table of every preloaded process; the ros_trace_* interposers and the two
-// rcl loaned-message wrappers below are the ONLY contract and are re-exported explicitly.
+// the dynamic symbol table of every preloaded process; the ros_trace_* interposers, the two
+// rcl loaned-message wrappers and the three rcl fini wrappers below are the ONLY contract and
+// are re-exported explicitly.
 // test/integration/test_symbols.py pins this.
 #define ROS2_PULSE_EXPORT __attribute__((visibility("default")))
 
@@ -568,10 +583,12 @@ ROS2_PULSE_EXPORT void ros_trace_rclcpp_intra_publish(const void* publisher_hand
 // Take-layer receive for every rcl client. Emitted by rmw_cyclonedds_cpp and rmw_fastrtps_*_cpp
 // on humble (typed takes; serialized and loaned takes emit nothing there), and by rmw_connextdds
 // and rmw_zenoh_cpp on newer distros. Fires on every take ATTEMPT; the registry returns on
-// taken=false before any lookup, and ignores rclcpp-owned subscriptions (see the file header).
+// taken=false before any lookup, and does not count rclcpp-owned subscriptions (see the file
+// header). With gap tracking on, source_timestamp (the DDS source timestamp, epoch ns) feeds the
+// topic's message age for every subscription, rclcpp's included.
 ROS2_PULSE_EXPORT void ros_trace_rmw_take(const void* rmw_subscription_handle, const void* message,
                                           int64_t source_timestamp, const bool taken) {
-    ProbeRuntime::instance().registry().onTake(rmw_subscription_handle, taken);
+    ProbeRuntime::instance().registry().onTake(rmw_subscription_handle, taken, source_timestamp);
     static auto fn =
         realFn<void (*)(const void*, const void*, int64_t, bool)>("ros_trace_rmw_take");
     if (fn) fn(rmw_subscription_handle, message, source_timestamp, taken);
@@ -631,8 +648,8 @@ void warnUnresolved(const char* name) {
     static std::atomic<bool> warned{false};
     bool expected = false;
     if (warned.compare_exchange_strong(expected, true)) {
-        std::fprintf(stderr, "[ros2_pulse] cannot resolve real %s, loaned-message counting "
-                             "disabled for this call path\n", name);
+        std::fprintf(stderr, "[ros2_pulse] cannot resolve real %s, the wrapper returns "
+                             "RCL_RET_ERROR for this call path\n", name);
     }
 }
 }  // namespace
@@ -669,6 +686,63 @@ ROS2_PULSE_EXPORT int32_t rcl_take_loaned_message(const void* subscription, void
         ros2_pulse::core::countLoanedTake(ret, *loaned_message)) {
         ProbeRuntime::instance().registry().onLoanedTake(subscription);
     }
+    return ret;
+}
+
+// ---- graph teardown: rcl fini functions, NOT tracepoints (PR #72 review) ----
+//
+// ros2_tracing has init tracepoints for nodes, publishers and subscriptions but no fini or
+// destroy ones, so without these a destroyed endpoint stayed reported for the life of the
+// process (a once-proven subscription as a stalled inter=0.0 endpoint of a live node) and a
+// recycled node address handed the destroyed node's endpoints to the next node. rclcpp's handle
+// deleters (librclcpp) and rclpy (its pybind module) call these through their PLT, like the
+// loaned wrappers above; a call from inside librcl itself (rcl_node_fini finalizing the node's
+// /rosout publisher) may bind directly, which is why the registry retires everything still
+// bound to a node handle at its rcl_node_fini.
+//
+// Graph-rate, never on the per-message path. Same ABI rules as the loaned wrappers: opaque
+// pointers, the int32_t rcl_ret_t, every argument forwarded verbatim, nothing dereferenced.
+// The signatures (rcl_publisher_fini(rcl_publisher_t*, rcl_node_t*), rcl_subscription_fini
+// (rcl_subscription_t*, rcl_node_t*), rcl_node_fini(rcl_node_t*)) are identical humble..rolling.
+// The registry is told AFTER the real call: the handle address cannot be reused before the
+// caller frees it, which is after we return, and the outcome is irrelevant, the caller is
+// tearing the object down either way. No ensureStarted(): a teardown must never start the probe.
+// The real call is made through a pointer resolved once (realRclSym), so rcl_node_fini calling
+// rcl_publisher_fini through librcl's own PLT re-enters the publisher wrapper, never itself.
+
+ROS2_PULSE_EXPORT int32_t rcl_publisher_fini(void* publisher, void* node) {
+    using Fn = int32_t (*)(void*, void*);
+    static auto fn = reinterpret_cast<Fn>(realRclSym("rcl_publisher_fini"));
+    if (fn == nullptr) {
+        warnUnresolved("rcl_publisher_fini");
+        return kRclRetError;
+    }
+    const int32_t ret = fn(publisher, node);
+    ProbeRuntime::instance().registry().onPublisherFini(publisher);
+    return ret;
+}
+
+ROS2_PULSE_EXPORT int32_t rcl_subscription_fini(void* subscription, void* node) {
+    using Fn = int32_t (*)(void*, void*);
+    static auto fn = reinterpret_cast<Fn>(realRclSym("rcl_subscription_fini"));
+    if (fn == nullptr) {
+        warnUnresolved("rcl_subscription_fini");
+        return kRclRetError;
+    }
+    const int32_t ret = fn(subscription, node);
+    ProbeRuntime::instance().registry().onSubscriptionFini(subscription);
+    return ret;
+}
+
+ROS2_PULSE_EXPORT int32_t rcl_node_fini(void* node) {
+    using Fn = int32_t (*)(void*);
+    static auto fn = reinterpret_cast<Fn>(realRclSym("rcl_node_fini"));
+    if (fn == nullptr) {
+        warnUnresolved("rcl_node_fini");
+        return kRclRetError;
+    }
+    const int32_t ret = fn(node);
+    ProbeRuntime::instance().registry().onNodeFini(node);
     return ret;
 }
 

@@ -29,7 +29,8 @@ auto sprintfStr(const char* fmt, T value) -> std::string {
 
 auto formatWindow(const std::vector<sTopicStat>& stats, const std::vector<std::string>& nodes,
                   long long ts_ns, double window_s, bool emit_idle,
-                  const std::vector<std::string>& warnings) -> std::string {
+                  const std::vector<std::string>& warnings,
+                  const std::vector<sEndpointStat>* endpoints) -> std::string {
     std::string out;
     // Reserve a rough upper bound so the common window is built without reallocating.
     out.reserve(64 + stats.size() * 96 + nodes.size() * 32 + warnings.size() * 64);
@@ -127,6 +128,42 @@ auto formatWindow(const std::vector<sTopicStat>& stats, const std::vector<std::s
         out += '\n';
     }
 
+    // Per-endpoint split (opt-in in text). LAST in the block so every older line kind keeps its
+    // position, and a NEW kind whose first token prefixes no older one: the in-tree parsers
+    // sscanf "NODE %s" etc., where the space directive matches zero whitespace, so a kind like
+    // "NODEX" would have parsed as a NODE line. Fields after the side are key=value, so the
+    // optional node / max_dt_ms / loaned_hz never shift a positional reader.
+    if (endpoints != nullptr) {
+        for (const auto& e : *endpoints) {
+            if (!TopicRegistry::shouldEmitEndpoint(e, emit_idle)) {
+                continue;
+            }
+            out += "EP ";
+            out += e.topic;
+            out += ' ';
+            out += endpointSideName(e.side);
+            out += " id=";
+            out += std::to_string(e.id);
+            if (!e.node.empty()) {
+                out += " node=";
+                out += e.node;
+            }
+            out += " inter=";
+            out += sprintfStr("%.6f", e.inter_hz);
+            out += " intra=";
+            out += sprintfStr("%.6f", e.intra_hz);
+            if (e.has_max_dt) {
+                out += " max_dt_ms=";
+                out += sprintfStr("%.3f", e.max_dt_ms);
+            }
+            if (e.loaned_count > 0) {
+                out += " loaned_hz=";
+                out += sprintfStr("%.6f", e.loaned_hz);
+            }
+            out += '\n';
+        }
+    }
+
     out += '\n';  // blank line closes the window block
     return out;
 }
@@ -171,7 +208,8 @@ void appendJsonBound(std::string& out, double v) {
 
 auto formatWindowJsonl(const std::vector<sTopicStat>& stats, const std::vector<std::string>& nodes,
                        long long ts_ns, double window_s, bool emit_idle,
-                       const std::vector<sRateWarning>& warnings) -> std::string {
+                       const std::vector<sRateWarning>& warnings,
+                       const std::vector<sEndpointStat>* endpoints, bool partial) -> std::string {
     std::string out;
     // Rough upper bound (fields are wider than their text twins), same single-write goal.
     out.reserve(96 + stats.size() * 192 + nodes.size() * 40 + warnings.size() * 112);
@@ -186,6 +224,11 @@ auto formatWindowJsonl(const std::vector<sTopicStat>& stats, const std::vector<s
     // golden-byte testable and a text↔jsonl diff differs in structure only, never in value.
     out += "\",\"window_s\":";
     out += sprintfStr("%.3f", window_s);
+    // Attach / exit window (see the header): absent, not false, on a full one, so every
+    // existing record stays byte-identical.
+    if (partial) {
+        out += ",\"partial\":true";
+    }
 
     out += ",\"topics\":[";
     bool first = true;
@@ -197,7 +240,8 @@ auto formatWindowJsonl(const std::vector<sTopicStat>& stats, const std::vector<s
             TopicRegistry::shouldEmitTopic(s, emit_idle) || s.pub_intra_count > 0;
         const bool recv_side = TopicRegistry::shouldEmitRecv(s);
         const bool loaned = s.pub_loaned_count > 0 || s.recv_loaned_count > 0;
-        if (!pub_side && !recv_side && !s.has_pub_max_dt && !s.has_recv_max_dt && !loaned) {
+        if (!pub_side && !recv_side && !s.has_pub_max_dt && !s.has_recv_max_dt && !loaned &&
+            !s.has_recv_dt && !s.has_recv_age) {
             continue;
         }
         if (!first) {
@@ -238,6 +282,29 @@ auto formatWindowJsonl(const std::vector<sTopicStat>& stats, const std::vector<s
         if (s.has_recv_max_dt) {
             out += ",\"recv_max_dt_ms\":";
             out += sprintfStr("%.3f", s.recv_max_dt_ms);
+        }
+        // Receive-side distributions (jsonl only, the text JITTER line keeps its '$'-anchored
+        // shape): what pulse_bridge needs for the MINIMUM / STDDEV of message_period and for
+        // message_age. Same absence rule: no interval or no source timestamp, no key.
+        if (s.has_recv_dt) {
+            out += ",\"recv_min_dt_ms\":";
+            out += sprintfStr("%.3f", s.recv_dt.min_ms);
+            out += ",\"recv_stddev_dt_ms\":";
+            out += sprintfStr("%.3f", s.recv_dt.stddev_ms);
+        }
+        if (s.has_recv_age) {
+            out += ",\"recv_age_avg_ms\":";
+            out += sprintfStr("%.3f", s.recv_age.mean_ms);
+            out += ",\"recv_age_min_ms\":";
+            out += sprintfStr("%.3f", s.recv_age.min_ms);
+            out += ",\"recv_age_max_ms\":";
+            out += sprintfStr("%.3f", s.recv_age.max_ms);
+            if (s.recv_age.has_stddev) {  // absent, not 0, when the window's squares overflowed
+                out += ",\"recv_age_stddev_ms\":";
+                out += sprintfStr("%.3f", s.recv_age.stddev_ms);
+            }
+            out += ",\"recv_age_count\":";
+            out += sprintfStr("%llu", static_cast<unsigned long long>(s.recv_age.count));
         }
         // Loaned subsets (rclcpp#3153 follow-up): absent when zero, like the text LOAN lines.
         // A subset of pub_inter_hz / the recv total, never added to them.
@@ -307,8 +374,84 @@ auto formatWindowJsonl(const std::vector<sTopicStat>& stats, const std::vector<s
         }
     }
 
-    out += "]}\n";  // '\n' closes the record: one object per line (jsonlines.org)
+    out += ']';
+
+    // Per-endpoint split of the topic sums. Present whenever the caller passes it (the probe
+    // always does), so "endpoints":[] means "measured, nothing to report" and an absent key
+    // means an older probe. Same gates and absence rules as the topic entries.
+    if (endpoints != nullptr) {
+        out += ",\"endpoints\":[";
+        bool first_ep = true;
+        for (const auto& e : *endpoints) {
+            if (!TopicRegistry::shouldEmitEndpoint(e, emit_idle)) {
+                continue;
+            }
+            if (!first_ep) {
+                out += ',';
+            }
+            first_ep = false;
+            out += "{\"topic\":\"";
+            appendJsonEscaped(out, e.topic);
+            out += "\",\"side\":\"";
+            out += endpointSideName(e.side);
+            out += "\",\"id\":";
+            out += std::to_string(e.id);
+            // Absent when the owning node's rcl_node_init was never seen: "" would read as a
+            // node with an empty name.
+            if (!e.node.empty()) {
+                out += ",\"node\":\"";
+                appendJsonEscaped(out, e.node);
+                out += '"';
+            }
+            out += ",\"inter_hz\":";
+            out += sprintfStr("%.6f", e.inter_hz);
+            out += ",\"intra_hz\":";
+            out += sprintfStr("%.6f", e.intra_hz);
+            if (e.has_max_dt) {
+                out += ",\"max_dt_ms\":";
+                out += sprintfStr("%.3f", e.max_dt_ms);
+            }
+            // This subscription's own distributions, the per-handle twins of the topic's
+            // recv_*_dt / recv_age_* keys (jsonl only, like those). Same absence rule.
+            if (e.has_recv_dt) {
+                out += ",\"avg_dt_ms\":";
+                out += sprintfStr("%.3f", e.recv_dt.mean_ms);
+                out += ",\"min_dt_ms\":";
+                out += sprintfStr("%.3f", e.recv_dt.min_ms);
+                out += ",\"stddev_dt_ms\":";
+                out += sprintfStr("%.3f", e.recv_dt.stddev_ms);
+                out += ",\"dt_count\":";
+                out += sprintfStr("%llu", static_cast<unsigned long long>(e.recv_dt.count));
+            }
+            if (e.has_recv_age) {
+                out += ",\"age_avg_ms\":";
+                out += sprintfStr("%.3f", e.recv_age.mean_ms);
+                out += ",\"age_min_ms\":";
+                out += sprintfStr("%.3f", e.recv_age.min_ms);
+                out += ",\"age_max_ms\":";
+                out += sprintfStr("%.3f", e.recv_age.max_ms);
+                if (e.recv_age.has_stddev) {
+                    out += ",\"age_stddev_ms\":";
+                    out += sprintfStr("%.3f", e.recv_age.stddev_ms);
+                }
+                out += ",\"age_count\":";
+                out += sprintfStr("%llu", static_cast<unsigned long long>(e.recv_age.count));
+            }
+            if (e.loaned_count > 0) {
+                out += ",\"loaned_hz\":";
+                out += sprintfStr("%.6f", e.loaned_hz);
+            }
+            out += '}';
+        }
+        out += ']';
+    }
+
+    out += "}\n";  // '\n' closes the record: one object per line (jsonlines.org)
     return out;
+}
+
+auto endpointSideName(eEndpointSide side) -> const char* {
+    return side == eEndpointSide::kPub ? "pub" : "recv";
 }
 
 auto defaultOutputPath(long pid, const char* tmpdir) -> std::string {
