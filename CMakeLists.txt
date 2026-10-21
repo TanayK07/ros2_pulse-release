@@ -82,7 +82,7 @@ else()
   )
   target_link_libraries(${PROJECT_NAME} PRIVATE ${PROJECT_NAME}_core ${CMAKE_DL_LIBS})
   # Preloaded into every process on the robot: export ONLY the ros_trace_* interposer contract
-  # plus the two rcl loaned-message wrappers (explicit visibility("default") in interposers.cpp,
+  # plus the rcl loaned-message and fini wrappers (explicit visibility("default") in interposers.cpp,
   # named in exports.map), nothing else may leak into the host's
   # dynamic symbol namespace (KNOWN_ISSUES #14; pinned by test/integration/test_symbols.py).
   # The core objects are linked in statically, so they get the same treatment.
@@ -107,9 +107,23 @@ else()
   # graph and free of rclcpp; this is the only target here that links it.
   find_package(rclcpp REQUIRED)
   find_package(statistics_msgs REQUIRED)
+  # diagnostics:=true output (/diagnostics for diagnostic_aggregator). common_interfaces, so
+  # always there where rclcpp is.
+  find_package(diagnostic_msgs REQUIRED)
   add_executable(pulse_bridge src/bridge/pulse_bridge.cpp)
   target_link_libraries(pulse_bridge PRIVATE
-    ${PROJECT_NAME}_core rclcpp::rclcpp ${statistics_msgs_TARGETS})
+    ${PROJECT_NAME}_core rclcpp::rclcpp ${statistics_msgs_TARGETS} ${diagnostic_msgs_TARGETS})
+  # Optional graph-monitor output (rosgraph_monitor_msgs/TopicStatistics, ros-tooling/graph-monitor
+  # #14). Declared in package.xml, so release builds have it; a source build without the package
+  # still gets the /statistics bridge, and the graph_monitor parameter only warns.
+  find_package(rosgraph_monitor_msgs QUIET)
+  if(rosgraph_monitor_msgs_FOUND)
+    target_link_libraries(pulse_bridge PRIVATE ${rosgraph_monitor_msgs_TARGETS})
+    target_compile_definitions(pulse_bridge PRIVATE ROS2_PULSE_HAVE_ROSGRAPH_MONITOR_MSGS)
+    message(STATUS "pulse_bridge: rosgraph_monitor_msgs found, graph-monitor output built")
+  else()
+    message(STATUS "pulse_bridge: rosgraph_monitor_msgs not found, graph-monitor output left out")
+  endif()
   install(TARGETS pulse_bridge RUNTIME DESTINATION lib/${PROJECT_NAME})
 
   if(BUILD_TESTING)
@@ -196,7 +210,9 @@ else()
       ament_add_pytest_test(integration_format test/integration/test_format.py
         TIMEOUT 120)
       # pulse_bridge: a hand-written jsonl log comes back on /statistics in the built-in
-      # topic-statistics shape, appended windows are followed, text logs are refused.
+      # topic-statistics shape, appended windows are followed, text logs are refused, and
+      # graph_monitor:=true adds rosgraph_monitor_msgs/TopicStatistics (skipped when absent),
+      # diagnostics:=true maps the probe's warns and log staleness onto /diagnostics.
       ament_add_pytest_test(integration_bridge test/integration/test_bridge.py
         TIMEOUT 120)
     endif()
