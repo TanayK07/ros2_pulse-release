@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "ros2_pulse/core/rate_spec.hpp"
 #include "ros2_pulse/core/topic_registry.hpp"
 
 namespace ros2_pulse::core {
@@ -20,6 +21,16 @@ struct sLogWindow {
     double window_s{0.0};
     std::vector<sTopicStat> stats;
     std::vector<std::string> nodes;
+    // Per-endpoint split (jsonl "endpoints", text EP lines), rates only like stats. Empty when
+    // the log carries none (an older probe, or text without ROS_TOPIC_STATS_ENDPOINTS=1).
+    std::vector<sEndpointStat> endpoints;
+    // jsonl "partial":true: the probe's attach or exit window, whose rates are not a full
+    // window's (see formatWindowJsonl). Always false for text, which does not carry it.
+    bool partial{false};
+    // jsonl "warns": the probe's own expected-rate verdict for this window, as written. Read for
+    // pulse_bridge's /diagnostics; pulse-check ignores it and re-derives verdicts from the rates.
+    // An element of an unknown kind is dropped. Always empty for text (WARN lines are skipped).
+    std::vector<sRateWarning> warns;
 };
 
 /// @brief Parse a probe log (any number of windows) back into structured form.
@@ -27,15 +38,16 @@ struct sLogWindow {
 /// Consumes BOTH on-disk formats, sniffed per line so mixed files work:
 ///  - text: the exact grammar formatWindow() emits, `# ts_ns=... window_s=...` headers,
 ///    TOPIC / PUB / RECV / JITTER / NODE lines, merged into one sTopicStat per topic per
-///    window;
+///    window, and EP lines into sLogWindow::endpoints;
 ///  - jsonl (ROADMAP R6): a '{' first byte is one self-contained formatWindowJsonl() record,
 ///    no text line can start with '{' (it is not a valid ROS name character), so the sniff
 ///    cannot misfire. pulse-check therefore gates jsonl logs identically: picking the
 ///    exporter-friendly format never costs CI/watchdog gating.
 ///
-/// Unknown text lines (e.g. WARN) and unknown jsonl keys (e.g. "warns") are ignored, so
-/// pulse-check re-evaluates from the raw rates rather than trusting probe-side warnings, and
-/// a newer probe's additive fields don't break an older reader. Malformed jsonl lines (a
+/// Unknown text lines (e.g. WARN) and unknown jsonl keys are ignored, so a newer probe's
+/// additive fields don't break an older reader. jsonl "warns" is parsed into
+/// sLogWindow::warns, but pulse-check never reads it: it re-evaluates from the raw rates rather
+/// than trusting probe-side warnings. Malformed jsonl lines (a
 /// truncated tail after a crash) are skipped, one torn record costs one window, like a torn
 /// text block. Pure; used by the pulse-check CLI and unit-tested round-trip against both
 /// emitters.
