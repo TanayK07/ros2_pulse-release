@@ -57,3 +57,17 @@ tracks:
     vcs_type: git
     vcs_uri: https://github.com/TanayK07/ros2_pulse.git
     version: :{auto}
+  rolling:
+    actions: *id001
+    devel_branch: null
+    last_release: null
+    last_version: null
+    name: ros2_pulse
+    patches: null
+    release_inc: '0'
+    release_repo_url: null
+    release_tag: v:{version}
+    ros_distro: rolling
+    vcs_type: git
+    vcs_uri: https://github.com/TanayK07/ros2_pulse.git
+    version: :{auto}
